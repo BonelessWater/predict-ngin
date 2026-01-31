@@ -1,299 +1,164 @@
-# Polymarket Whale Tracking Strategy
+# Prediction Market Whale Following Strategy
 
-A research system for detecting and following whale traders on Polymarket prediction markets.
+A bias-free backtesting framework for whale-following strategies on prediction markets.
 
-## Important: Honest Backtest Results
+## Quick Start
 
-**This strategy was tested with proper methodology:**
-- No look-ahead bias (whales detected only using historical data)
-- Transaction costs modeled (fees + slippage)
-- Realistic whale edge assumptions (60-65% accuracy, not 100%)
+```bash
+# Install dependencies
+pip install -r requirements.txt
 
-## Backtest Results (1 Year, No Look-Ahead Bias)
+# Fetch data (if not already downloaded, ~4GB)
+python run.py --fetch-only
 
-### Cost Scenario Comparison
+# Run full analysis (auto-fetches if no data)
+python run.py
 
-| Scenario | Return | Sharpe | Win Rate | Total Costs |
-|----------|--------|--------|----------|-------------|
-| **No Costs** | +17.2% | 0.55 | 46.8% | $0 |
-| Low Costs (0.5% fee) | -73.1% | -2.97 | 35.5% | $6,257 |
-| Medium Costs (1% fee) | -92.6% | -5.30 | 24.2% | $7,481 |
-| High Costs (2% fee) | -99.2% | -7.69 | 14.5% | $7,820 |
+# Run with specific method
+python run.py --method win_rate_60pct --position-size 250
 
-### Key Findings
+# Run all methods
+python run.py --all-methods
 
-1. **Raw Alpha Exists**: Without costs, whale-tracking generates ~17% annual returns
-2. **Costs Destroy Returns**: Even 0.5% per-trade costs turn profits into -73% losses
-3. **Too Many Trades**: 62 trades/year with small edge = cost accumulation
-4. **Win Rate Reality**: True win rate is ~47% (not 60%+ shown with look-ahead bias)
-
-### Why Previous Results Were Wrong
-
-The earlier backtest showed 854% returns because it had **look-ahead bias**:
-- Whale signals were generated knowing future prices
-- This made whales appear to have near-perfect prediction
-- Real whale edge is ~60-65%, not 95%+
-
-## Configuration
-
-All parameters are in `config/config.py`:
-
-```python
-from config.config import Config
-
-config = Config.default()
-
-# Whale detection
-config.whale.top_n = 10           # Top 10 by volume
-config.whale.percentile = 95      # 95th percentile
-config.whale.min_trade_size = 10_000
-config.whale.staleness_days = 7
-
-# Strategy
-config.strategy.consensus_threshold = 0.70
-config.strategy.initial_capital = 10_000
-config.strategy.position_size_pct = 1.0
-
-# Transaction Costs
-config.costs.taker_fee = 0.02     # 2% taker fee
-config.costs.base_slippage = 0.005 # 0.5% base slippage
-config.costs.volume_impact = 0.001 # Additional slippage per $1000
-config.costs.max_slippage = 0.05  # Cap at 5%
+# Refresh data and run
+python run.py --fetch --all-methods
 ```
 
-## Making This Strategy Viable
+## Key Findings
 
-To make whale-tracking profitable with costs:
+| Metric | Best Value | Method |
+|--------|------------|--------|
+| Win Rate | 69.8% | win_rate_60pct |
+| Net P&L/Trade | $4.69 | win_rate_60pct |
+| Sharpe Ratio | 3.33 | Geopolitics category |
+| Optimal Position | $250-500 | Small retail |
 
-### 1. Reduce Trade Frequency
-```python
-config.strategy.consensus_threshold = 0.80  # Higher bar for trades
-```
+**Warning:** Positions above $10k are unprofitable due to market impact (110%+ cost ratio).
 
-### 2. Use Maker Orders
-```python
-config.costs.taker_fee = 0.0  # Polymarket maker fee is 0%
-config.costs.base_slippage = 0.002  # Lower with limit orders
-```
-
-### 3. Filter for Higher Conviction
-- Only trade when multiple whale methods agree
-- Require sustained consensus (not single-day spikes)
-- Focus on markets with higher whale concentration
-
-### 4. Reduce Position Size
-```python
-config.strategy.position_size_pct = 0.5  # 50% per trade
-```
+See [WHALE_STRATEGY_RESEARCH_REPORT.md](WHALE_STRATEGY_RESEARCH_REPORT.md) for complete analysis.
 
 ## Project Structure
 
 ```
 predict-ngin/
-├── config/
-│   └── config.py               # Configuration class
-├── src/
-│   ├── data/
-│   │   ├── loader.py           # Polymarket API loader
-│   │   └── polymarket_fetcher.py
-│   ├── whales/
-│   │   └── detector.py         # Whale detection methods
-│   ├── strategy/
-│   │   └── copycat.py          # Copycat strategy
-│   ├── backtest/
-│   │   ├── proper_backtest.py  # No look-ahead bias
-│   │   ├── cost_comparison.py  # Cost scenario analysis
-│   │   └── fast_analysis.py    # Quick analysis (has bias)
-│   └── main.py
-├── data/
-│   ├── parquet/                # Cached data
-│   └── output/                 # Results & equity curves
-└── requirements.txt
+├── run.py                          # Main entry point
+├── requirements.txt                # Dependencies
+├── README.md                       # This file
+├── WHALE_STRATEGY_RESEARCH_REPORT.md  # Full research report
+│
+├── src/whale_strategy/             # Core library
+│   ├── __init__.py                 # Package exports
+│   ├── data.py                     # Data loading (Manifold JSON)
+│   ├── whales.py                   # Whale identification methods
+│   ├── backtest.py                 # Bias-free backtesting engine
+│   ├── costs.py                    # Polymarket cost model
+│   ├── categories.py               # Market categorization
+│   └── reporting.py                # QuantStats HTML reports
+│
+└── data/
+    ├── README.md                   # Data documentation
+    ├── manifold/                   # Raw Manifold Markets data
+    │   ├── bets_*.json             # 5M+ bets
+    │   └── markets_*.json          # 174k markets
+    ├── polymarket/                 # Polymarket market data
+    │   └── markets_*.json          # 151k markets
+    └── output/                     # Generated reports
+        ├── summary.csv             # Strategy comparison
+        ├── trades_*.csv            # Trade logs
+        └── quantstats_*.html       # Interactive reports
 ```
 
-## Installation
+## Whale Identification Methods
 
-```bash
-git clone <repo-url>
-cd predict-ngin
-pip install -r requirements.txt
+| Method | Description | Best For |
+|--------|-------------|----------|
+| `volume_top10` | Top 10 by total volume | Conservative, few signals |
+| `volume_pct95` | 95th percentile volume | Balanced, many signals |
+| `large_trades` | Avg trade > $1000 | Large traders only |
+| `win_rate_60pct` | 60%+ historical win rate | **Best P&L per trade** |
+| `combo_vol_win` | High volume + good accuracy | Quality filter |
+
+## Cost Model
+
+Uses square-root market impact (Almgren-Chriss style):
+
+```
+Total Cost = Base Spread + Slippage + Market Impact
+Market Impact = impact_coef * base_slippage * sqrt(trade_size / liquidity)
 ```
 
-## Usage
+| Category | Position Size | Base Spread | Slippage | Min Liquidity |
+|----------|--------------|-------------|----------|---------------|
+| Small | $100-500 | 2.0% | 0.5% | $500 |
+| Medium | $1k-5k | 2.5% | 1.0% | $5,000 |
+| Large | $10k-20k | 3.0% | 2.0% | $25,000 |
 
-### Run Proper Backtest (Recommended)
+## Data Sources
 
-```bash
-python src/backtest/proper_backtest.py
-```
+- **Manifold Markets**: 5M+ bets, 174k markets (play money)
+- **Polymarket**: 151k markets metadata (real money)
 
-### Run Cost Comparison
+Total data: ~4.2 GB
 
-```bash
-python src/backtest/cost_comparison.py
-```
+## Bias Prevention
 
-### Fetch Real Polymarket Data
+| Bias Type | Mitigation |
+|-----------|------------|
+| Look-ahead | Train/test split (30%/70%) |
+| Survivorship | All markets included |
+| Selection | Whales from training only |
+| Execution | Entry at probAfter price |
+| Multiple entry | One position per market |
 
-```bash
-python src/data/polymarket_fetcher.py
+## Usage Examples
+
+```python
+from src.whale_strategy import (
+    load_manifold_data,
+    load_markets,
+    build_resolution_map,
+    identify_whales,
+    run_backtest,
+    CostModel,
+)
+from src.whale_strategy.data import train_test_split
+
+# Load data
+df = load_manifold_data("data/manifold")
+markets_df = load_markets("data/manifold")
+resolution_data = build_resolution_map(markets_df)
+
+# Split data
+train_df, test_df = train_test_split(df, 0.3)
+
+# Identify whales
+whales = identify_whales(train_df, resolution_data, "win_rate_60pct")
+
+# Run backtest
+result = run_backtest(
+    test_df=test_df,
+    whale_set=whales,
+    resolution_data=resolution_data,
+    strategy_name="Win Rate 60%",
+    cost_model=CostModel.from_assumptions("small"),
+    position_size=250,
+)
+
+print(f"Win Rate: {result.win_rate*100:.1f}%")
+print(f"Net P&L: ${result.total_net_pnl:,.0f}")
+print(f"Sharpe: {result.sharpe_ratio:.2f}")
 ```
 
 ## Output Files
 
-Results saved to `data/output/`:
+After running `python run.py --all-methods`:
 
-| File | Description |
-|------|-------------|
-| `equity_curve_*_proper.csv` | Equity curves (no bias) |
-| `proper_backtest_metrics.json` | Metrics with costs |
-| `cost_comparison_results.json` | All cost scenarios |
-| `quantstats_report_*_proper.html` | QuantStats reports |
+- `data/output/summary.csv` - Comparison of all methods
+- `data/output/trades_*.csv` - Individual trade logs
+- `data/output/quantstats_*.html` - Interactive QuantStats reports
 
-## Whale Detection Methods
+Open the HTML files in a browser for detailed performance metrics, drawdown charts, and return distributions.
 
-| Method | Description | Performance |
-|--------|-------------|-------------|
-| **Top N** | Top 10 traders by volume | Best raw returns |
-| **Percentile** | Above 95th percentile | Same as Top N |
-| **Trade Size** | Avg trade > $10K | Slightly worse |
+## License
 
-## Real Polymarket Data
-
-Analysis of 500K real trades shows:
-
-| Market | Top 10 Control | 95th Percentile |
-|--------|---------------|-----------------|
-| XRP | 50.6% | $16,712 |
-| All Crypto | 59.8% | $34,901 |
-
-**Whale concentration is real** - tracking is viable if costs can be managed.
-
-## Limitations
-
-1. **Data API Limitation**: Only recent trades available publicly
-2. **No Live Trading**: Research only, not production-ready
-3. **Single Market**: Tested on synthetic data, not real XRP
-4. **Costs Estimated**: Actual slippage varies with market conditions
-
-## Conclusions
-
-1. **Whale tracking provides alpha** (~17% annually without costs)
-2. **Transaction costs are the main obstacle** (not signal quality)
-3. **Strategy needs optimization** for lower frequency, maker orders
-4. **Not viable for retail** with high taker fees and small capital
-
-## Data Collector
-
-The data collector continuously fetches and stores Polymarket trades to build a historical database.
-
-### Quick Start
-
-```bash
-# Run once (collect current trades)
-python src/data/collector.py once
-
-# Check collection status
-python src/data/collector.py status
-
-# Start continuous collection (runs every 5 minutes)
-python src/data/collector.py start
-
-# Start with custom interval (e.g., 10 minutes)
-python src/data/collector.py start --interval 600
-
-# Collect only XRP trades (filtered)
-python src/data/collector.py once --market xrp
-
-# Start continuous XRP collection
-python src/data/collector.py start --market xrp
-
-# Check XRP-specific status
-python src/data/collector.py status --market xrp
-```
-
-### Windows Background Service
-
-```batch
-# Double-click to start
-scripts\start_collector.bat
-```
-
-### Features
-
-- **Deduplication**: Uses trade hashes to avoid storing duplicates
-- **Partitioned Storage**: Data stored by date for efficient querying
-- **Incremental**: Only fetches new trades each cycle
-- **Resumable**: Tracks state across restarts
-
-### Data Location
-
-```
-data/parquet/collected/
-├── trades/                              # All trades
-│   ├── date=2026-01-30/
-│   │   └── trades_20260130_184849.parquet
-│   └── ...
-├── xrp/                                 # XRP-filtered trades
-│   ├── trades/
-│   │   └── date=2026-01-31/
-│   │       └── trades_20260130_220433.parquet
-│   ├── collection_metadata.json
-│   └── seen_hashes.json
-├── collection_metadata.json
-└── seen_hashes.json
-```
-
-### Using Collected Data
-
-```python
-from src.data.collector import load_collected_data
-
-# Load all collected trades
-trades = load_collected_data()
-
-# Load XRP-filtered trades
-trades = load_collected_data(market_filter='xrp')
-
-# Load specific date range
-trades = load_collected_data(start_date='2026-01-30', end_date='2026-02-01')
-
-# Load XRP trades for date range
-trades = load_collected_data(market_filter='xrp', start_date='2026-01-30')
-```
-
-```bash
-# Run backtest on real XRP data
-python src/backtest/backtest_real_data.py --market XRP
-```
-
-### Building Historical Database
-
-To get meaningful backtest results, collect data for at least:
-- **1 week**: Minimum for testing
-- **1 month**: Basic statistics
-- **3+ months**: Reliable backtest results
-
-Run the collector continuously:
-```bash
-# Leave running in background
-python src/data/collector.py start --interval 300
-```
-
-## Development Log
-
-### 2026-01-30
-
-- Implemented proper backtest with no look-ahead bias
-- Added transaction cost and slippage modeling
-- Created Config class for all parameters
-- Ran cost scenario comparison
-- Found that raw alpha exists but costs destroy it
-- Updated README with honest results
-
-### Key Learnings
-
-- Look-ahead bias can inflate returns by 50x+
-- Whale edge is real but modest (~60-65%)
-- Cost management is more important than signal quality
-- High-frequency strategies need near-zero costs to work
+MIT

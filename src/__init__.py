@@ -1,1 +1,1 @@
-# Polymarket Whale Tracking System
+# Prediction Market Analysis Package
