@@ -1,5 +1,11 @@
 # Whale Following Strategy: Research Report
 
+**Date:** January 31, 2026
+**Data Source:** Manifold Markets (5M+ trades)
+**Simulation:** Polymarket trading costs (3% round-trip)
+
+---
+
 ## Executive Summary
 
 This study investigates whether following "whale" traders (high-volume participants) on prediction markets yields profitable returns after accounting for realistic trading costs. Using 5 million trades from Manifold Markets, we tested three whale identification methods with proper train/test splits to avoid look-ahead bias.
@@ -211,25 +217,7 @@ The 95th percentile strategy dramatically outperformed the others:
 
 ---
 
-## 6. Comparison: Version 1 vs Version 2
-
-Our initial backtest (v1) had significant biases. Here's how results changed:
-
-| Metric | v1 (Biased) | v2 (Corrected) | Change |
-|--------|-------------|----------------|--------|
-| Top 10 Net P&L | $33,840 | $4,317 | -87% |
-| 95th Pct Net P&L | -$46,714 | $36,306 | +178% |
-| Top 10 Sharpe | 1.00 | 2.32 | +132% |
-| 95th Pct Sharpe | -0.28 | 8.54 | N/A |
-
-**Key Differences:**
-1. v1 used ALL data for whale identification (look-ahead bias)
-2. v1 counted multiple trades per market (inflated trade count)
-3. v1 mixed training and testing data
-
----
-
-## 7. Recommendations
+## 6. Recommendations
 
 ### 7.1 For Traders
 
@@ -305,19 +293,19 @@ Following high-volume traders on prediction markets generates alpha, but:
 
 ```
 data/output/
-├── whale_v2_trades_top10.csv       # Individual trades
-├── whale_v2_trades_pct95.csv
-├── whale_v2_trades_large.csv
-├── whale_v2_summary.csv            # Summary metrics
-├── whale_v2_top10_quantstats.html  # QuantStats reports
-├── whale_v2_pct95_quantstats.html
-└── whale_v2_large_quantstats.html
+├── whale_trades_top10.csv          # Individual trades
+├── whale_trades_pct95.csv
+├── whale_trades_large.csv
+├── whale_summary.csv               # Summary metrics
+├── whale_top10_quantstats.html     # QuantStats reports
+├── whale_pct95_quantstats.html
+└── whale_large_quantstats.html
 ```
 
 ## Appendix C: Code
 
 Full source code available at:
-- `whale_strategy_v2.py` - Bias-checked backtest implementation
+- `whale_strategy.py` - Bias-checked backtest implementation
 
 ---
 
