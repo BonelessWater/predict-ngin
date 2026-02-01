@@ -18,6 +18,27 @@ from scipy import stats
 from .costs import CostModel, DEFAULT_COST_MODEL
 
 
+def _calculate_concurrent_positions(trades_df: pd.DataFrame) -> pd.Series:
+    """Calculate number of concurrent open positions over time."""
+    if "entry_time" not in trades_df.columns or "exit_time" not in trades_df.columns:
+        return pd.Series([0])
+
+    events = []
+    for _, row in trades_df.iterrows():
+        events.append((row["entry_time"], 1))  # Open position
+        events.append((row["exit_time"], -1))  # Close position
+
+    events.sort(key=lambda x: x[0])
+
+    concurrent = 0
+    concurrent_series = []
+    for _, delta in events:
+        concurrent += delta
+        concurrent_series.append(concurrent)
+
+    return pd.Series(concurrent_series)
+
+
 @dataclass
 class BacktestResult:
     """Results from a backtest run."""
@@ -37,6 +58,10 @@ class BacktestResult:
     sharpe_ratio: float
     max_drawdown: float
     roi_pct: float
+    position_size: float
+    avg_holding_days: float
+    max_concurrent_positions: int
+    avg_concurrent_positions: float
     trades_df: pd.DataFrame = field(repr=False)
     daily_returns: pd.Series = field(repr=False)
 
@@ -166,6 +191,11 @@ def run_backtest(
         question = res_data.get("question", "")[:60]
         question = question.encode("ascii", "replace").decode("ascii")
 
+        # Calculate holding period
+        entry_time = pd.to_datetime(trade_time, unit="ms") if isinstance(trade_time, (int, float)) else trade["datetime"]
+        exit_time = pd.to_datetime(res_time, unit="ms") if res_time else entry_time
+        holding_days = (exit_time - entry_time).total_seconds() / 86400 if res_time else 0
+
         trades.append({
             "datetime": trade["datetime"],
             "date": trade["date"],
@@ -177,6 +207,9 @@ def run_backtest(
             "gross_pnl": gross_pnl,
             "net_pnl": net_pnl,
             "question": question,
+            "entry_time": entry_time,
+            "exit_time": exit_time,
+            "holding_days": holding_days,
         })
 
     if not trades:
@@ -222,6 +255,14 @@ def run_backtest(
     # ROI
     roi = total_net / starting_capital * 100
 
+    # Holding period stats
+    avg_holding_days = trades_df["holding_days"].mean() if "holding_days" in trades_df.columns else 0
+
+    # Calculate concurrent positions over time
+    concurrent_positions = _calculate_concurrent_positions(trades_df)
+    max_concurrent = concurrent_positions.max() if len(concurrent_positions) > 0 else 0
+    avg_concurrent = concurrent_positions.mean() if len(concurrent_positions) > 0 else 0
+
     return BacktestResult(
         strategy_name=strategy_name,
         total_trades=total_trades,
@@ -238,6 +279,10 @@ def run_backtest(
         sharpe_ratio=sharpe,
         max_drawdown=max_dd,
         roi_pct=roi,
+        position_size=position_size,
+        avg_holding_days=avg_holding_days,
+        max_concurrent_positions=int(max_concurrent),
+        avg_concurrent_positions=avg_concurrent,
         trades_df=trades_df,
         daily_returns=daily_returns,
     )
@@ -263,6 +308,15 @@ def print_result(result: BacktestResult) -> None:
     print()
     print(f"Sharpe Ratio:           {result.sharpe_ratio:>12.2f}")
     print(f"Max Drawdown:           ${result.max_drawdown:>12,.2f}")
+    print()
+    print("--- Capital Allocation ---")
+    print(f"Position Size:          ${result.position_size:>12,.0f}")
+    print(f"Avg Holding Period:      {result.avg_holding_days:>12.1f} days")
+    print(f"Max Concurrent Pos:      {result.max_concurrent_positions:>12,}")
+    print(f"Avg Concurrent Pos:      {result.avg_concurrent_positions:>12.1f}")
+    if result.max_concurrent_positions > 0:
+        peak_capital = result.max_concurrent_positions * result.position_size
+        print(f"Peak Capital Required:  ${peak_capital:>12,.0f}")
 
     # Statistical significance
     sig = result.statistical_significance()
@@ -270,3 +324,212 @@ def print_result(result: BacktestResult) -> None:
     print(f"T-statistic:            {sig['t_stat']:>12.3f}")
     print(f"P-value (returns):      {sig['p_value']:>12.4f}")
     print(f"P-value (win rate):     {sig['binom_p']:>12.4f}")
+
+
+def run_position_size_analysis(
+    test_df: pd.DataFrame,
+    whale_set: Set[str],
+    resolution_data: Dict[str, Dict[str, Any]],
+    position_sizes: List[float] = None,
+    total_capital: float = 100000,
+    cost_categories: List[str] = None,
+) -> pd.DataFrame:
+    """
+    Analyze performance across different position sizes.
+
+    Args:
+        test_df: Test period bets DataFrame
+        whale_set: Set of whale user IDs
+        resolution_data: Market resolution mapping
+        position_sizes: List of position sizes to test
+        total_capital: Total capital available
+        cost_categories: Cost model categories to test
+
+    Returns:
+        DataFrame with results for each position size
+    """
+    from .costs import CostModel, COST_ASSUMPTIONS
+
+    if position_sizes is None:
+        position_sizes = [100, 250, 500, 1000, 2500, 5000, 10000]
+
+    if cost_categories is None:
+        cost_categories = ["small", "medium", "large"]
+
+    results = []
+
+    for pos_size in position_sizes:
+        # Determine appropriate cost category
+        if pos_size <= 500:
+            cost_cat = "small"
+        elif pos_size <= 5000:
+            cost_cat = "medium"
+        else:
+            cost_cat = "large"
+
+        cost_model = CostModel.from_assumptions(cost_cat)
+        min_liq = COST_ASSUMPTIONS[cost_cat].liquidity_threshold
+
+        result = run_backtest(
+            test_df=test_df,
+            whale_set=whale_set,
+            resolution_data=resolution_data,
+            strategy_name=f"${pos_size:,}",
+            cost_model=cost_model,
+            position_size=pos_size,
+            min_liquidity=min_liq,
+        )
+
+        if result:
+            max_positions = int(total_capital / pos_size)
+            capital_utilization = min(
+                result.avg_concurrent_positions * pos_size / total_capital * 100,
+                100
+            )
+
+            results.append({
+                "position_size": pos_size,
+                "cost_category": cost_cat,
+                "trades": result.total_trades,
+                "win_rate": result.win_rate * 100,
+                "gross_pnl": result.total_gross_pnl,
+                "costs": result.total_costs,
+                "net_pnl": result.total_net_pnl,
+                "cost_pct": result.total_costs / result.total_gross_pnl * 100 if result.total_gross_pnl > 0 else 0,
+                "pnl_per_trade": result.total_net_pnl / result.total_trades if result.total_trades > 0 else 0,
+                "avg_holding_days": result.avg_holding_days,
+                "max_concurrent": result.max_concurrent_positions,
+                "avg_concurrent": result.avg_concurrent_positions,
+                "max_positions_allowed": max_positions,
+                "capital_utilization": capital_utilization,
+                "peak_capital": result.max_concurrent_positions * pos_size,
+            })
+
+    return pd.DataFrame(results)
+
+
+def run_rolling_backtest(
+    df: pd.DataFrame,
+    resolution_data: Dict[str, Dict[str, Any]],
+    method: str = "volume_pct95",
+    lookback_months: int = 3,
+    position_size: float = 100,
+    cost_model: Optional[CostModel] = None,
+) -> pd.DataFrame:
+    """
+    Run rolling monthly backtest with whale recalculation each month.
+
+    Args:
+        df: Full bets DataFrame
+        resolution_data: Market resolution mapping
+        method: Whale identification method
+        lookback_months: Months of history for whale identification
+        position_size: Position size in dollars
+        cost_model: Cost model to use
+
+    Returns:
+        DataFrame with monthly results
+    """
+    from .whales import identify_whales
+
+    if cost_model is None:
+        cost_model = DEFAULT_COST_MODEL
+
+    # Get unique months
+    months = sorted(df["month"].unique())
+    results = []
+
+    print(f"\nRolling Monthly Backtest ({lookback_months}-month lookback)")
+    print("-" * 70)
+    print(f"{'Month':<10} | {'Whales':>6} | {'Trades':>6} | {'Win%':>6} | {'Gross':>10} | {'Net':>10}")
+    print("-" * 70)
+
+    for i, month in enumerate(months):
+        if i < lookback_months:
+            continue
+
+        # Training data: previous N months
+        train_months = months[i - lookback_months:i]
+        train_df = df[df["month"].isin(train_months)]
+
+        # Test data: current month
+        test_df = df[df["month"] == month]
+
+        if len(train_df) < 1000 or len(test_df) < 100:
+            continue
+
+        # Identify whales from training period
+        whales = identify_whales(train_df, resolution_data, method)
+
+        if len(whales) == 0:
+            continue
+
+        # Run backtest on test month
+        result = run_backtest(
+            test_df=test_df,
+            whale_set=whales,
+            resolution_data=resolution_data,
+            strategy_name=str(month),
+            cost_model=cost_model,
+            position_size=position_size,
+        )
+
+        if result and result.total_trades > 0:
+            results.append({
+                "month": str(month),
+                "whales": len(whales),
+                "trades": result.total_trades,
+                "win_rate": result.win_rate * 100,
+                "gross_pnl": result.total_gross_pnl,
+                "net_pnl": result.total_net_pnl,
+                "avg_holding_days": result.avg_holding_days,
+            })
+
+            print(
+                f"{month!s:<10} | {len(whales):>6} | {result.total_trades:>6} | "
+                f"{result.win_rate*100:>5.1f}% | ${result.total_gross_pnl:>9,.0f} | "
+                f"${result.total_net_pnl:>9,.0f}"
+            )
+
+    results_df = pd.DataFrame(results)
+
+    if len(results_df) > 0:
+        print("-" * 70)
+        print(
+            f"{'TOTAL':<10} | {results_df['whales'].mean():>6.0f} | "
+            f"{results_df['trades'].sum():>6} | {results_df['win_rate'].mean():>5.1f}% | "
+            f"${results_df['gross_pnl'].sum():>9,.0f} | ${results_df['net_pnl'].sum():>9,.0f}"
+        )
+        print()
+        print(f"Average whales per month: {results_df['whales'].mean():.0f}")
+        print(f"Total trades: {results_df['trades'].sum():,}")
+        print(f"Average monthly win rate: {results_df['win_rate'].mean():.1f}%")
+        print(f"Total net P&L: ${results_df['net_pnl'].sum():,.0f}")
+
+    return results_df
+
+
+def print_position_size_analysis(df: pd.DataFrame, total_capital: float = 100000) -> None:
+    """Print formatted position size analysis."""
+    print(f"\n{'='*80}")
+    print(f"POSITION SIZE ANALYSIS (Capital: ${total_capital:,.0f})")
+    print(f"{'='*80}")
+    print()
+    print(f"{'Size':>10} | {'Trades':>7} | {'Win%':>6} | {'Net P&L':>12} | {'$/Trade':>8} | {'Hold':>6} | {'MaxPos':>6} | {'Peak$':>10}")
+    print("-" * 80)
+
+    for _, row in df.iterrows():
+        print(
+            f"${row['position_size']:>9,} | "
+            f"{row['trades']:>7,} | "
+            f"{row['win_rate']:>5.1f}% | "
+            f"${row['net_pnl']:>11,.0f} | "
+            f"${row['pnl_per_trade']:>7.2f} | "
+            f"{row['avg_holding_days']:>5.0f}d | "
+            f"{row['max_concurrent']:>6,} | "
+            f"${row['peak_capital']:>9,.0f}"
+        )
+
+    print()
+    print("Note: Larger positions require more liquidity, reducing tradeable markets.")
+    print("Peak$ = Maximum capital deployed at any point (MaxPos * Size)")

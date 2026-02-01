@@ -8,7 +8,14 @@ Supports multiple whale identification methods, market categorization, and posit
 from .data import load_manifold_data, load_markets, build_resolution_map
 from .fetcher import DataFetcher, ensure_data_exists
 from .whales import identify_whales, WHALE_METHODS
-from .backtest import run_backtest, BacktestResult, print_result
+from .backtest import (
+    run_backtest,
+    BacktestResult,
+    print_result,
+    run_position_size_analysis,
+    print_position_size_analysis,
+    run_rolling_backtest,
+)
 from .costs import CostModel, COST_ASSUMPTIONS
 from .categories import categorize_market, CATEGORIES
 from .reporting import generate_quantstats_report, generate_all_reports
@@ -25,6 +32,9 @@ __all__ = [
     "run_backtest",
     "BacktestResult",
     "print_result",
+    "run_position_size_analysis",
+    "print_position_size_analysis",
+    "run_rolling_backtest",
     "CostModel",
     "COST_ASSUMPTIONS",
     "categorize_market",

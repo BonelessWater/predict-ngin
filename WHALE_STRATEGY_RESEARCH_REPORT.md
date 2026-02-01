@@ -144,6 +144,8 @@ By identifying and following these traders, we may capture some of their edge.
 
 Instead of static whale identification, we recalculate monthly using only the prior 3 months of data. This simulates real-world implementation.
 
+Run with: `python run.py --rolling --lookback 3`
+
 ### 5.2 Monthly Performance
 
 | Month | Whales | Trades | Win Rate | Net P&L |
@@ -356,9 +358,15 @@ whales = users[
 ### 9.1 The Capital Constraint Problem
 
 Original backtest assumes unlimited capital. Reality:
-- Average holding period: **87 days**
-- Capital locked until resolution
+- Average holding period: **~87 days**
+- Capital locked until market resolution
 - Must skip trades when capital exhausted
+- Peak concurrent positions: **1,500+** (with unlimited capital)
+
+The backtest now tracks:
+- **Holding period**: Time from entry to market resolution
+- **Concurrent positions**: How many positions are open simultaneously
+- **Peak capital**: Maximum capital deployed at any point
 
 ### 9.2 Realistic Returns by Capital
 
@@ -378,7 +386,25 @@ Original backtest assumes unlimited capital. Reality:
 | **60 days** | **4,525** | **$10,495** | **21.0%** |
 | **90 days** | **5,163** | **$13,584** | **27.2%** |
 
-### 9.4 Recommendation
+### 9.4 Position Size Analysis
+
+Run `python run.py --analyze-sizes` to compare position sizes:
+
+| Size | Trades | Win% | Net P&L | $/Trade | Hold | MaxPos | Peak$ |
+|------|--------|------|---------|---------|------|--------|-------|
+| $100 | 8,402 | 68.5% | $17,356 | $2.07 | 87d | 1,500+ | $150k+ |
+| $250 | 8,402 | 68.5% | $43,390 | $5.16 | 87d | 1,500+ | $375k+ |
+| $500 | 8,402 | 68.5% | $86,780 | $10.33 | 87d | 1,500+ | $750k+ |
+| $1,000 | 335 | 63.6% | $19,227 | $57.39 | 87d | ~200 | $200k |
+| $5,000 | 335 | 62.4% | $87,747 | $261.93 | 87d | ~200 | $1M |
+| $10,000 | 12 | 58.3% | -$656 | -$54.65 | 87d | ~10 | $100k |
+
+**Key insights:**
+- Larger positions require more liquidity, drastically reducing tradeable markets
+- $500 position offers best total P&L with reasonable capital requirements
+- $10k+ positions are unprofitable due to market impact costs
+
+### 9.5 Recommendation
 
 ```
 Capital:        $50,000 - $100,000
@@ -509,21 +535,41 @@ def should_trade(market):
 
 ```
 data/output/
-├── whale_summary.csv                    # Core strategy comparison
-├── whale_trades_*.csv                   # Individual trade logs
-├── whale_*_quantstats.html              # Interactive performance reports
-├── rolling_whale_results.csv            # Monthly rolling backtest
-├── alternative_signals_results.csv      # Signal comparison
-├── category_results.csv                 # Performance by market type
-├── large_position_results.csv           # Position size analysis
-└── position_size_assumptions.csv        # Cost model assumptions
+├── summary.csv                          # Core strategy comparison
+├── trades_*.csv                         # Individual trade logs
+├── quantstats_*.html                    # Interactive performance reports
+└── position_size_analysis.csv           # Position size comparison
 ```
 
-## Appendix B: Code
+## Appendix B: Code Structure
 
-- `whale_strategy.py` - Core backtest implementation
-- `advanced_research.py` - Extended research (categories, signals, rolling)
-- `large_position_research.py` - Position sizing and market impact analysis
+```
+src/whale_strategy/
+├── __init__.py       # Package exports
+├── data.py           # Data loading (auto-fetches if needed)
+├── fetcher.py        # API data fetching
+├── whales.py         # 7 whale identification methods
+├── backtest.py       # Bias-free backtesting with capital tracking
+├── costs.py          # Market impact cost model
+├── categories.py     # Market categorization
+└── reporting.py      # QuantStats HTML reports
+```
+
+## Appendix B2: Running the Analysis
+
+```bash
+# Basic run
+python run.py
+
+# All methods comparison
+python run.py --all-methods
+
+# Position size analysis
+python run.py --analyze-sizes --capital 100000
+
+# Best method with optimal size
+python run.py --method win_rate_60pct --position-size 250
+```
 
 ## Appendix C: Position Size Assumptions Detail
 

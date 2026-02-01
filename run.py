@@ -33,6 +33,9 @@ from src.whale_strategy import (
     identify_whales,
     run_backtest,
     print_result,
+    run_position_size_analysis,
+    print_position_size_analysis,
+    run_rolling_backtest,
     generate_all_reports,
     categorize_market,
     CostModel,
@@ -114,6 +117,28 @@ Examples:
         action="store_true",
         help="Only fetch data, don't run backtest",
     )
+    parser.add_argument(
+        "--analyze-sizes",
+        action="store_true",
+        help="Analyze different position sizes ($100-$10k)",
+    )
+    parser.add_argument(
+        "--capital",
+        type=float,
+        default=100000,
+        help="Total capital for position size analysis (default: 100000)",
+    )
+    parser.add_argument(
+        "--rolling",
+        action="store_true",
+        help="Run rolling monthly whale identification and backtest",
+    )
+    parser.add_argument(
+        "--lookback",
+        type=int,
+        default=3,
+        help="Months of lookback for rolling whale identification (default: 3)",
+    )
 
     args = parser.parse_args()
 
@@ -192,9 +217,48 @@ Examples:
             print("    No valid trades")
             results[method] = None
 
+    # Position size analysis
+    if args.analyze_sizes:
+        print(f"\n[6] Position size analysis...")
+        # Use the best method for size analysis
+        best_method = "win_rate_60pct" if "win_rate_60pct" in methods else methods[0]
+        whales = identify_whales(train_df, resolution_data, best_method)
+
+        size_df = run_position_size_analysis(
+            test_df=test_df,
+            whale_set=whales,
+            resolution_data=resolution_data,
+            total_capital=args.capital,
+        )
+        print_position_size_analysis(size_df, args.capital)
+
+        # Save to CSV
+        size_df.to_csv(Path(args.output_dir) / "position_size_analysis.csv", index=False)
+        print(f"\nSaved: {args.output_dir}/position_size_analysis.csv")
+
+    # Rolling whale identification
+    if args.rolling:
+        step = 7 if args.analyze_sizes else 6
+        print(f"\n[{step}] Rolling monthly whale identification...")
+
+        rolling_df = run_rolling_backtest(
+            df=df,
+            resolution_data=resolution_data,
+            method=args.method,
+            lookback_months=args.lookback,
+            position_size=args.position_size,
+            cost_model=cost_model,
+        )
+
+        # Save to CSV
+        if len(rolling_df) > 0:
+            rolling_df.to_csv(Path(args.output_dir) / "rolling_monthly_results.csv", index=False)
+            print(f"\nSaved: {args.output_dir}/rolling_monthly_results.csv")
+
     # Generate reports
     if not args.no_reports:
-        print(f"\n[6] Generating reports...")
+        step = 8 if args.rolling else (7 if args.analyze_sizes else 6)
+        print(f"\n[{step}] Generating reports...")
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         generate_all_reports(results, args.output_dir)
 

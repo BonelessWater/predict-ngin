@@ -77,7 +77,7 @@ def save_summary_csv(
 
 def generate_all_reports(
     results: dict,
-    output_dir: str = "data/output",
+    output_dir: str = "data/output/html_reports",
 ) -> None:
     """
     Generate all reports for backtest results.

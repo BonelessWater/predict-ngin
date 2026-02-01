@@ -20,20 +20,63 @@ python run.py --method win_rate_60pct --position-size 250
 # Run all methods
 python run.py --all-methods
 
+# Analyze different position sizes ($100-$10k)
+python run.py --analyze-sizes --capital 100000
+
+# Rolling monthly whale identification (recalculates whales each month)
+python run.py --rolling --lookback 3
+
 # Refresh data and run
 python run.py --fetch --all-methods
 ```
 
 ## Key Findings
 
-| Metric | Best Value | Method |
-|--------|------------|--------|
-| Win Rate | 69.8% | win_rate_60pct |
-| Net P&L/Trade | $4.69 | win_rate_60pct |
-| Sharpe Ratio | 3.33 | Geopolitics category |
-| Optimal Position | $250-500 | Small retail |
+Based on 5M+ bets from Manifold Markets (Dec 2024 - Jan 2026):
 
-**Warning:** Positions above $10k are unprofitable due to market impact (110%+ cost ratio).
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Data | 5,001,000 bets | 174,400 markets |
+| Resolved Markets | 89,765 | YES/NO binary |
+| Train/Test Split | 30%/70% | Temporal split |
+
+### Strategy Performance (volume_pct95)
+
+| Metric | Value |
+|--------|-------|
+| Whales Identified | 545 |
+| Trades Executed | 8,402 |
+| Win Rate | 68.5% |
+| Gross P&L | $53,663 |
+
+### Best Methods
+
+| Method | Win Rate | Net P&L/Trade |
+|--------|----------|---------------|
+| `win_rate_60pct` | 69.8% | $4.69 |
+| `volume_pct95` | 68.5% | $2.81 |
+| `combo_vol_win` | 71.4% | $3.58 |
+
+### Category Performance
+
+| Category | Sharpe | Win Rate |
+|----------|--------|----------|
+| Geopolitics | 3.33 | 70.9% |
+| AI/Tech | 3.31 | 72.4% |
+| Crypto | 2.66 | 68.4% |
+| Sports | 0.44 | 60.3% |
+
+### Capital Allocation
+
+| Metric | Value |
+|--------|-------|
+| Avg Holding Period | ~87 days |
+| Max Concurrent Positions | ~1,500+ |
+| Peak Capital Required | Varies by position size |
+
+**Capital constraint:** With long holding periods (~87 days), capital gets locked in positions. With $100k capital and $500 positions, you can hold ~200 concurrent positions.
+
+**Warning:** Positions above $10k are unprofitable due to market impact (110%+ cost ratio). Optimal position size is $250-500.
 
 See [WHALE_STRATEGY_RESEARCH_REPORT.md](WHALE_STRATEGY_RESEARCH_REPORT.md) for complete analysis.
 
@@ -49,6 +92,7 @@ predict-ngin/
 ├── src/whale_strategy/             # Core library
 │   ├── __init__.py                 # Package exports
 │   ├── data.py                     # Data loading (Manifold JSON)
+│   ├── fetcher.py                  # API data fetching
 │   ├── whales.py                   # Whale identification methods
 │   ├── backtest.py                 # Bias-free backtesting engine
 │   ├── costs.py                    # Polymarket cost model
@@ -149,13 +193,49 @@ print(f"Net P&L: ${result.total_net_pnl:,.0f}")
 print(f"Sharpe: {result.sharpe_ratio:.2f}")
 ```
 
+## Example Output
+
+```
+======================================================================
+WHALE FOLLOWING STRATEGY BACKTEST
+======================================================================
+
+[1] Loading data...
+    Loaded 5,001,000 bets
+    Date range: 2024-12-13 to 2026-01-31
+    Loaded 174,400 markets
+
+[2] Building resolution map...
+    Resolved YES/NO markets: 89,765
+
+[3] Train/test split...
+    Training: 1,500,300 bets (30%)
+    Testing:  3,500,700 bets (70%)
+
+[4] Cost model: Small Retail ($100-500)
+
+[5] Running backtests...
+    Method: volume_pct95 - 95th percentile by volume
+    Identified 545 whales
+
+============================================================
+STRATEGY: volume_pct95
+============================================================
+Unique Markets Traded:  8,402
+Total Trades:           8,402
+Win Rate:               68.5%
+Gross P&L:              $53,662.70
+```
+
 ## Output Files
 
-After running `python run.py --all-methods`:
+After running `python run.py --all-methods --analyze-sizes --rolling`:
 
 - `data/output/summary.csv` - Comparison of all methods
 - `data/output/trades_*.csv` - Individual trade logs
 - `data/output/quantstats_*.html` - Interactive QuantStats reports
+- `data/output/position_size_analysis.csv` - Position size comparison
+- `data/output/rolling_monthly_results.csv` - Monthly rolling backtest
 
 Open the HTML files in a browser for detailed performance metrics, drawdown charts, and return distributions.
 
