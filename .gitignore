@@ -1,6 +1,28 @@
 .claude
 venv
+
+.env
+requirements-dev.txt
+
+# Agents
+AGENTS.md
+HEARTBEAT.md
+IDENTITY.md
+SOUL.md
+USER.md
+TOOLS.md
+MEMORY.md
+
+docs/
+
+# Caching
 __pycache__/
 *.pyc
-.env
-data
+.pytest_cache/
+
+# Data
+data/output/
+data/parquet/
+data/polymarket_clob/
+prediction_markets.db
+prediction_markets_sample.db

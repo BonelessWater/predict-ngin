@@ -5,9 +5,7 @@ A bias-free backtesting framework for whale-following strategies on prediction m
 Supports multiple whale identification methods, market categorization, and position sizing analysis.
 """
 
-from .data import load_manifold_data, load_markets, build_resolution_map
-from .fetcher import DataFetcher, ensure_data_exists
-from .whales import identify_whales, WHALE_METHODS
+from .strategy import identify_whales, WHALE_METHODS, identify_whales_rolling
 from .backtest import (
     run_backtest,
     BacktestResult,
@@ -16,18 +14,19 @@ from .backtest import (
     print_position_size_analysis,
     run_rolling_backtest,
 )
-from .costs import CostModel, COST_ASSUMPTIONS
-from .categories import categorize_market, CATEGORIES
-from .reporting import generate_quantstats_report, generate_all_reports
+from .polymarket_whales import (
+    load_polymarket_trades,
+    calculate_trader_stats,
+    identify_polymarket_whales,
+    generate_whale_signals,
+    run_polymarket_whale_analysis,
+    POLY_WHALE_METHODS,
+)
 
 __version__ = "1.0.0"
 __all__ = [
-    "load_manifold_data",
-    "load_markets",
-    "build_resolution_map",
-    "DataFetcher",
-    "ensure_data_exists",
     "identify_whales",
+    "identify_whales_rolling",
     "WHALE_METHODS",
     "run_backtest",
     "BacktestResult",
@@ -35,10 +34,10 @@ __all__ = [
     "run_position_size_analysis",
     "print_position_size_analysis",
     "run_rolling_backtest",
-    "CostModel",
-    "COST_ASSUMPTIONS",
-    "categorize_market",
-    "CATEGORIES",
-    "generate_quantstats_report",
-    "generate_all_reports",
+    "load_polymarket_trades",
+    "calculate_trader_stats",
+    "identify_polymarket_whales",
+    "generate_whale_signals",
+    "run_polymarket_whale_analysis",
+    "POLY_WHALE_METHODS",
 ]

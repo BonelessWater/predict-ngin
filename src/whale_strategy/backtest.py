@@ -10,33 +10,13 @@ Addresses potential biases:
 """
 
 import pandas as pd
-import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, Set, List, Any, Optional
 from scipy import stats
 
-from .costs import CostModel, DEFAULT_COST_MODEL
-
-
-def _calculate_concurrent_positions(trades_df: pd.DataFrame) -> pd.Series:
-    """Calculate number of concurrent open positions over time."""
-    if "entry_time" not in trades_df.columns or "exit_time" not in trades_df.columns:
-        return pd.Series([0])
-
-    events = []
-    for _, row in trades_df.iterrows():
-        events.append((row["entry_time"], 1))  # Open position
-        events.append((row["exit_time"], -1))  # Close position
-
-    events.sort(key=lambda x: x[0])
-
-    concurrent = 0
-    concurrent_series = []
-    for _, delta in events:
-        concurrent += delta
-        concurrent_series.append(concurrent)
-
-    return pd.Series(concurrent_series)
+from trading.data_modules.costs import CostModel, COST_ASSUMPTIONS, DEFAULT_COST_MODEL
+from trading.portfolio import PortfolioConstraints, PositionSizer, PortfolioState
+from trading.reporting import compute_daily_returns, compute_run_metrics
 
 
 @dataclass
@@ -59,11 +39,20 @@ class BacktestResult:
     max_drawdown: float
     roi_pct: float
     position_size: float
+    starting_capital: float
     avg_holding_days: float
     max_concurrent_positions: int
     avg_concurrent_positions: float
     trades_df: pd.DataFrame = field(repr=False)
     daily_returns: pd.Series = field(repr=False)
+    avg_position_size: float = 0.0
+    max_position_size: float = 0.0
+    max_concurrent_capital: float = 0.0
+    # Open position tracking (with defaults for backward compatibility)
+    open_positions: int = 0
+    open_capital: float = 0
+    open_unrealized_pnl: float = 0
+    closed_trades: int = 0
 
     def statistical_significance(self) -> Dict[str, float]:
         """Calculate statistical significance metrics."""
@@ -98,6 +87,9 @@ def run_backtest(
     starting_capital: float = 10000,
     min_liquidity: float = 0,
     category_filter: Optional[str] = None,
+    include_open: bool = False,
+    portfolio_constraints: Optional[PortfolioConstraints] = None,
+    position_sizer: Optional[PositionSizer] = None,
 ) -> Optional[BacktestResult]:
     """
     Run bias-free backtest of whale following strategy.
@@ -112,12 +104,24 @@ def run_backtest(
         starting_capital: Starting capital for ROI calculation
         min_liquidity: Minimum market liquidity to trade
         category_filter: Only trade this category (if set)
+        portfolio_constraints: Portfolio risk controls and market filters
+        position_sizer: Optional position sizing rules
 
     Returns:
         BacktestResult or None if no valid trades
     """
     if cost_model is None:
         cost_model = DEFAULT_COST_MODEL
+
+    if portfolio_constraints is None:
+        portfolio_constraints = PortfolioConstraints(min_liquidity=min_liquidity)
+    elif min_liquidity > portfolio_constraints.min_liquidity:
+        portfolio_constraints.min_liquidity = min_liquidity
+
+    if position_sizer is None:
+        position_sizer = PositionSizer(base_position_size=position_size)
+
+    portfolio = PortfolioState(constraints=portfolio_constraints)
 
     # Filter to whale trades
     whale_trades = test_df[test_df["userId"].isin(whale_set)].copy()
@@ -139,51 +143,106 @@ def run_backtest(
         if contract_id in positions:
             continue
 
-        # Must be resolved
+        # Must have market data
         if contract_id not in resolution_data:
             continue
 
         res_data = resolution_data[contract_id]
-        resolution = res_data["resolution"]
+        is_resolved = res_data.get("is_resolved", True)  # Default True for backward compat
         liquidity = res_data.get("liquidity", 1000)
+        volume = res_data.get("volume", 0)
 
-        # Check liquidity
-        if liquidity < min_liquidity:
+        # Skip open markets unless include_open is True
+        if not is_resolved and not include_open:
+            continue
+
+        category = res_data.get("category", "other")
+        if not portfolio_constraints.market_allowed(category, liquidity, volume):
             continue
 
         # Category filter
         if category_filter:
-            category = res_data.get("category", "other")
             if category != category_filter:
                 continue
 
-        # Must trade before resolution
         trade_time = trade["createdTime"]
-        res_time = res_data["resolved_time"]
-        if res_time and trade_time >= res_time:
-            continue
-
         outcome = trade["outcome"]
         prob_after = trade["probAfter"]
+        entry_time = (
+            pd.to_datetime(trade_time, unit="ms")
+            if isinstance(trade_time, (int, float))
+            else trade["datetime"]
+        )
 
-        # Calculate entry/exit prices
-        if outcome == "YES":
-            entry_price = prob_after
-            exit_price = resolution
+        portfolio.close_positions_through(entry_time)
+
+        # Handle resolved vs open markets differently
+        if is_resolved:
+            resolution = res_data["resolution"]
+            res_time = res_data["resolved_time"]
+
+            # Must trade before resolution
+            if res_time and trade_time >= res_time:
+                continue
+
+            # Calculate entry/exit prices for resolved markets
+            if outcome == "YES":
+                entry_price = prob_after
+                exit_price = resolution
+            else:
+                entry_price = 1 - prob_after
+                exit_price = 1 - resolution
+
+            status = "closed"
         else:
-            entry_price = 1 - prob_after
-            exit_price = 1 - resolution
+            # Open market - use current probability as mark-to-market
+            current_prob = res_data.get("current_prob", 0.5)
+            res_time = None
+
+            if outcome == "YES":
+                entry_price = prob_after
+                exit_price = current_prob  # Mark-to-market
+            else:
+                entry_price = 1 - prob_after
+                exit_price = 1 - current_prob
+
+            status = "open"
 
         # Skip extreme prices
         if entry_price < 0.02 or entry_price > 0.98:
             continue
 
-        # Apply costs
-        entry_cost = cost_model.calculate_entry_price(entry_price, position_size, liquidity)
-        exit_proceeds = cost_model.calculate_exit_price(exit_price, position_size, liquidity)
+        effective_position_size = position_sizer.size_for_market(
+            liquidity=liquidity,
+            capital_available=portfolio.available_capital(),
+            cap_per_market=portfolio_constraints.max_capital_per_market,
+        )
+        if effective_position_size <= 0:
+            continue
 
-        gross_pnl = (exit_price - entry_price) * position_size
-        net_pnl = (exit_proceeds - entry_cost) * position_size
+        if not portfolio.can_open(category, effective_position_size):
+            continue
+
+        # Apply costs
+        entry_cost = cost_model.calculate_entry_price(
+            entry_price, effective_position_size, liquidity
+        )
+        # For open positions, don't apply exit costs yet (unrealized)
+        if status == "closed":
+            exit_proceeds = cost_model.calculate_exit_price(
+                exit_price, effective_position_size, liquidity
+            )
+        else:
+            exit_proceeds = exit_price * effective_position_size  # No exit cost for open
+
+        gross_pnl = (exit_price - entry_price) * effective_position_size
+        if status == "closed":
+            net_pnl = (exit_proceeds - entry_cost) * effective_position_size
+        else:
+            # Unrealized P&L (entry cost already paid, exit cost not yet)
+            net_pnl = (exit_price * effective_position_size) - (
+                entry_cost * effective_position_size
+            )
 
         positions[contract_id] = True
 
@@ -192,20 +251,33 @@ def run_backtest(
         question = question.encode("ascii", "replace").decode("ascii")
 
         # Calculate holding period
-        entry_time = pd.to_datetime(trade_time, unit="ms") if isinstance(trade_time, (int, float)) else trade["datetime"]
-        exit_time = pd.to_datetime(res_time, unit="ms") if res_time else entry_time
-        holding_days = (exit_time - entry_time).total_seconds() / 86400 if res_time else 0
+        if res_time:
+            exit_time = pd.to_datetime(res_time, unit="ms")
+            holding_days = (exit_time - entry_time).total_seconds() / 86400
+        else:
+            # For open positions, calculate days since entry
+            exit_time = pd.Timestamp.now()
+            holding_days = (exit_time - entry_time).total_seconds() / 86400
+
+        portfolio.open_position(
+            contract_id=contract_id,
+            category=category,
+            size=effective_position_size,
+            exit_time=exit_time,
+        )
 
         trades.append({
             "datetime": trade["datetime"],
             "date": trade["date"],
             "contract_id": contract_id,
             "whale_id": trade["userId"],
+            "status": status,
             "outcome": outcome,
             "entry_price": entry_price,
             "exit_price": exit_price,
             "gross_pnl": gross_pnl,
             "net_pnl": net_pnl,
+            "position_size": effective_position_size,
             "question": question,
             "entry_time": entry_time,
             "exit_time": exit_time,
@@ -219,72 +291,44 @@ def run_backtest(
     trades_df = trades_df.sort_values("datetime")
     trades_df["cumulative_pnl"] = trades_df["net_pnl"].cumsum()
 
-    # Daily returns for Sharpe
-    daily_pnl = trades_df.groupby("date")["net_pnl"].sum()
-    daily_returns = daily_pnl / starting_capital
-
-    # Calculate metrics
-    total_trades = len(trades_df)
-    winners = trades_df[trades_df["net_pnl"] > 0]
-    losers = trades_df[trades_df["net_pnl"] <= 0]
-
-    win_rate = len(winners) / total_trades if total_trades > 0 else 0
-    total_gross = trades_df["gross_pnl"].sum()
-    total_net = trades_df["net_pnl"].sum()
-    total_costs = total_gross - total_net
-
-    avg_win = winners["net_pnl"].mean() if len(winners) > 0 else 0
-    avg_loss = losers["net_pnl"].mean() if len(losers) > 0 else 0
-
-    # Profit factor
-    gross_wins = winners["net_pnl"].sum() if len(winners) > 0 else 0
-    gross_losses = abs(losers["net_pnl"].sum()) if len(losers) > 0 else 1
-    profit_factor = gross_wins / gross_losses if gross_losses > 0 else float("inf")
-
-    # Sharpe ratio (annualized)
-    if len(daily_returns) > 1 and daily_returns.std() > 0:
-        sharpe = daily_returns.mean() / daily_returns.std() * np.sqrt(252)
-    else:
-        sharpe = 0
-
-    # Max drawdown
-    cummax = trades_df["cumulative_pnl"].cummax()
-    drawdown = cummax - trades_df["cumulative_pnl"]
-    max_dd = drawdown.max()
-
-    # ROI
-    roi = total_net / starting_capital * 100
-
-    # Holding period stats
-    avg_holding_days = trades_df["holding_days"].mean() if "holding_days" in trades_df.columns else 0
-
-    # Calculate concurrent positions over time
-    concurrent_positions = _calculate_concurrent_positions(trades_df)
-    max_concurrent = concurrent_positions.max() if len(concurrent_positions) > 0 else 0
-    avg_concurrent = concurrent_positions.mean() if len(concurrent_positions) > 0 else 0
+    daily_returns = compute_daily_returns(trades_df, starting_capital)
+    metrics = compute_run_metrics(
+        trades_df=trades_df,
+        starting_capital=starting_capital,
+        position_size=position_size,
+        daily_returns=daily_returns,
+    )
 
     return BacktestResult(
         strategy_name=strategy_name,
-        total_trades=total_trades,
-        unique_markets=trades_df["contract_id"].nunique(),
-        winning_trades=len(winners),
-        losing_trades=len(losers),
-        win_rate=win_rate,
-        total_gross_pnl=total_gross,
-        total_net_pnl=total_net,
-        total_costs=total_costs,
-        avg_win=avg_win,
-        avg_loss=avg_loss,
-        profit_factor=profit_factor,
-        sharpe_ratio=sharpe,
-        max_drawdown=max_dd,
-        roi_pct=roi,
+        total_trades=metrics.total_trades,
+        unique_markets=metrics.unique_markets,
+        winning_trades=metrics.winning_trades,
+        losing_trades=metrics.losing_trades,
+        win_rate=metrics.win_rate,
+        total_gross_pnl=metrics.total_gross_pnl,
+        total_net_pnl=metrics.total_net_pnl,
+        total_costs=metrics.total_costs,
+        avg_win=metrics.avg_win,
+        avg_loss=metrics.avg_loss,
+        profit_factor=metrics.profit_factor,
+        sharpe_ratio=metrics.sharpe_ratio,
+        max_drawdown=metrics.max_drawdown,
+        roi_pct=metrics.roi_pct,
         position_size=position_size,
-        avg_holding_days=avg_holding_days,
-        max_concurrent_positions=int(max_concurrent),
-        avg_concurrent_positions=avg_concurrent,
+        starting_capital=starting_capital,
+        avg_holding_days=metrics.avg_holding_days,
+        max_concurrent_positions=metrics.max_concurrent_positions,
+        avg_concurrent_positions=metrics.avg_concurrent_positions,
         trades_df=trades_df,
         daily_returns=daily_returns,
+        avg_position_size=metrics.avg_position_size,
+        max_position_size=metrics.max_position_size,
+        max_concurrent_capital=metrics.max_concurrent_capital,
+        open_positions=metrics.open_positions,
+        open_capital=metrics.open_capital,
+        open_unrealized_pnl=metrics.open_unrealized_pnl,
+        closed_trades=metrics.closed_trades,
     )
 
 
@@ -311,12 +355,26 @@ def print_result(result: BacktestResult) -> None:
     print()
     print("--- Capital Allocation ---")
     print(f"Position Size:          ${result.position_size:>12,.0f}")
+    if result.avg_position_size > 0 and abs(result.avg_position_size - result.position_size) > 0.01:
+        print(f"Avg Position Size:      ${result.avg_position_size:>12,.0f}")
+        print(f"Max Position Size:      ${result.max_position_size:>12,.0f}")
     print(f"Avg Holding Period:      {result.avg_holding_days:>12.1f} days")
     print(f"Max Concurrent Pos:      {result.max_concurrent_positions:>12,}")
     print(f"Avg Concurrent Pos:      {result.avg_concurrent_positions:>12.1f}")
-    if result.max_concurrent_positions > 0:
+    if result.max_concurrent_capital > 0:
+        print(f"Peak Capital Required:  ${result.max_concurrent_capital:>12,.0f}")
+    elif result.max_concurrent_positions > 0:
         peak_capital = result.max_concurrent_positions * result.position_size
         print(f"Peak Capital Required:  ${peak_capital:>12,.0f}")
+
+    # Open positions (if any)
+    if result.open_positions > 0:
+        print()
+        print("--- Open Positions ---")
+        print(f"Closed Trades:          {result.closed_trades:>12,}")
+        print(f"Open Positions:         {result.open_positions:>12,}")
+        print(f"Capital in Open:        ${result.open_capital:>12,.0f}")
+        print(f"Unrealized P&L:         ${result.open_unrealized_pnl:>12,.2f}")
 
     # Statistical significance
     sig = result.statistical_significance()
@@ -333,6 +391,7 @@ def run_position_size_analysis(
     position_sizes: List[float] = None,
     total_capital: float = 100000,
     cost_categories: List[str] = None,
+    include_open: bool = False,
 ) -> pd.DataFrame:
     """
     Analyze performance across different position sizes.
@@ -348,8 +407,6 @@ def run_position_size_analysis(
     Returns:
         DataFrame with results for each position size
     """
-    from .costs import CostModel, COST_ASSUMPTIONS
-
     if position_sizes is None:
         position_sizes = [100, 250, 500, 1000, 2500, 5000, 10000]
 
@@ -378,6 +435,7 @@ def run_position_size_analysis(
             cost_model=cost_model,
             position_size=pos_size,
             min_liquidity=min_liq,
+            include_open=include_open,
         )
 
         if result:
@@ -415,6 +473,7 @@ def run_rolling_backtest(
     lookback_months: int = 3,
     position_size: float = 100,
     cost_model: Optional[CostModel] = None,
+    include_open: bool = False,
 ) -> pd.DataFrame:
     """
     Run rolling monthly backtest with whale recalculation each month.
@@ -430,7 +489,7 @@ def run_rolling_backtest(
     Returns:
         DataFrame with monthly results
     """
-    from .whales import identify_whales
+    from .strategy import identify_whales
 
     if cost_model is None:
         cost_model = DEFAULT_COST_MODEL
@@ -472,6 +531,7 @@ def run_rolling_backtest(
             strategy_name=str(month),
             cost_model=cost_model,
             position_size=position_size,
+            include_open=include_open,
         )
 
         if result and result.total_trades > 0:
