@@ -108,9 +108,15 @@ class LiquidityStore(BaseStore["LiquiditySnapshot"]):
                     keep="last",
                 )
 
-            # Write with compression
+            # Write with Zstd compression for better ratio (optimized for 100GB+ datasets)
             table = pa.Table.from_pandas(df, preserve_index=False)
-            pq.write_table(table, filepath, compression="snappy")
+            pq.write_table(
+                table,
+                filepath,
+                compression="zstd",
+                compression_level=3,
+                row_group_size=500_000,  # Optimize row groups for predicate pushdown
+            )
 
             total_stored += len(records)
 

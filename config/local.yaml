@@ -7,16 +7,6 @@
 # Copy to config/local.yaml and customize
 
 # =============================================================================
-# DATABASE
-# =============================================================================
-database:
-  path: "data/prediction_markets.db"
-  polymarket_trades_path: "data/poly_data/processed/trades.csv"
-  parquet_dir: "data/parquet"
-  backup_enabled: true
-  backup_interval_hours: 24
-
-# =============================================================================
 # DATA COLLECTION
 # =============================================================================
 data:
@@ -208,8 +198,8 @@ backtest:
   max_holding_seconds: 172800 # 48 hours
 
   # Position sizing
-  default_position_size: 1000
-  position_sizes_to_test: [100, 250, 500, 1000, 2500, 5000, 10000]
+  default_position_size: 10
+  position_sizes_to_test: [10, 25, 50, 100, 250, 500, 1000]
 
   # Reporting
   output_dir: "data/output"

@@ -168,7 +168,7 @@ python scripts/merge_clob_shards.py 4             # Merge results
 
 ```bash
 pip install websockets
-python scripts/realtime_prices.py
+python scripts/data/realtime_prices.py
 ```
 
 ### Market Scanner
@@ -205,13 +205,13 @@ DISCORD_CHANNEL_ID=...
 Run a test message:
 
 ```bash
-python scripts/whale_trade_notifier.py --test
+python scripts/monitoring/whale_trade_notifier.py --test
 ```
 
 Start streaming with alerts:
 
 ```bash
-python scripts/whale_trade_notifier.py --min-usd 5000 --min-volume 20000
+python scripts/monitoring/whale_trade_notifier.py --min-usd 5000 --min-volume 20000
 ```
 
 ### Trade Alert Bot (Telegram/Discord)
@@ -233,20 +233,20 @@ DISCORD_CHANNEL_ID=...
 Run with defaults (tails `data/paper_trading_log.jsonl` and `data/execution_log.jsonl`):
 
 ```bash
-python scripts/trade_alert_bot.py
+python scripts/monitoring/trade_alert_bot.py
 ```
 
 Optional flags:
 
 ```bash
 # Read existing logs from the start
-python scripts/trade_alert_bot.py --from-start
+python scripts/monitoring/trade_alert_bot.py --from-start
 
 # Only alert on trades >= $500
-python scripts/trade_alert_bot.py --min-size 500
+python scripts/monitoring/trade_alert_bot.py --min-size 500
 
 # Specify a custom log file
-python scripts/trade_alert_bot.py --log data/paper_trading_log.jsonl
+python scripts/monitoring/trade_alert_bot.py --log data/paper_trading_log.jsonl
 ```
 
 ### Live Whale Tracker (Address-Based)
@@ -267,10 +267,10 @@ Examples:
 
 ```bash
 # Load whales from DB (top 25 by volume)
-python scripts/live_whale_tracker.py --db-path data/prediction_markets.db --max-whales 25
+python scripts/monitoring/live_whale_tracker.py --db-path data/prediction_markets.db --max-whales 25
 
 # Use a watchlist file (one address per line)
-python scripts/live_whale_tracker.py --whales-file data/whales.txt --min-usd 1000 --role taker
+python scripts/monitoring/live_whale_tracker.py --whales-file data/whales.txt --min-usd 1000 --role taker
 ```
 
 ## Cost Model

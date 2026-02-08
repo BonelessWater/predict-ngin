@@ -308,7 +308,9 @@ class DataFetcher:
                 pq.write_table(
                     table,
                     parquet_output_dir / f"markets_{file_num}.parquet",
-                    compression="snappy",
+                    compression="zstd",
+                    compression_level=3,
+                    row_group_size=500_000,  # Optimize row groups for predicate pushdown
                 )
 
         total_fetched = 0
@@ -475,7 +477,13 @@ class DataFetcher:
                 table = table.cast(schema)
 
         filename = markets_dir / f"markets_missing_{int(time.time())}.parquet"
-        pq.write_table(table, filename, compression="snappy")
+        pq.write_table(
+            table,
+            filename,
+            compression="zstd",
+            compression_level=3,
+            row_group_size=500_000,  # Optimize row groups for predicate pushdown
+        )
         return len(markets)
 
     def fetch_polymarket_price_history(
@@ -592,21 +600,21 @@ class DataFetcher:
 
     def fetch_polymarket_clob_data(
         self,
-        min_volume: float = 10000,
-        max_markets: int = 1000,
-        max_days: int = 90,
+        min_volume: float = 10000,  # Default: $10k minimum volume
+        max_markets: Optional[int] = None,
+        max_days: int = 1180,  # Default: ~3.2 years (matches existing trades data: Nov 21, 2022 - Dec 30, 2025)
         workers: int = MAX_WORKERS,
-        include_closed: bool = False,
+        include_closed: bool = True,  # Default: include closed markets for maximum historical data
     ) -> int:
         """
         Fetch historical price data for Polymarket markets (concurrent).
 
         Args:
-            min_volume: Minimum 24hr volume to include market
-            max_markets: Maximum number of markets to fetch
-            max_days: Days of history per market
-            workers: Number of concurrent workers
-            include_closed: Include closed markets in the scan
+            min_volume: Minimum 24hr volume to include market (default: 10000 = $10k)
+            max_markets: Maximum number of markets to fetch (default: None = unlimited)
+            max_days: Days of history per market (default: 1180 = ~3.2 years, matches existing trades data: Nov 21, 2022 - Dec 30, 2025)
+            workers: Number of concurrent workers (default: 20)
+            include_closed: Include closed markets in the scan (default: True for maximum historical data)
 
         Returns:
             Total markets fetched
@@ -617,12 +625,17 @@ class DataFetcher:
         # First, get list of markets with volume
         print("Fetching Polymarket markets...")
         markets_by_id: Dict[str, Dict[str, Any]] = {}
-        batch_size = 100
+        # Use smaller batch size for closed markets to avoid memory issues
+        batch_size = 50 if include_closed else 100
         closed_flags = ["false", "true"] if include_closed else ["false"]
 
         for closed_flag in closed_flags:
             offset = 0
-            while len(markets_by_id) < max_markets * 2:  # Fetch extra to filter
+            consecutive_empty_batches = 0
+            max_consecutive_empty = 3  # Stop after 3 empty batches in a row
+            # Fetch enough markets: if max_markets specified, fetch 2x to filter; otherwise fetch all
+            target_count = (max_markets * 2) if max_markets else float('inf')
+            while len(markets_by_id) < target_count:
                 self._rate_limit()
                 try:
                     response = self.session.get(
@@ -631,13 +644,43 @@ class DataFetcher:
                             "limit": batch_size,
                             "offset": offset,
                             "closed": closed_flag,
-                        }
+                        },
+                        timeout=60,  # Increase timeout for large responses
                     )
                     response.raise_for_status()
-                    batch = response.json()
+                    
+                    # Check response size before parsing (warn if > 50MB)
+                    content_length = response.headers.get('content-length')
+                    if content_length:
+                        size_mb = int(content_length) / (1024 * 1024)
+                        if size_mb > 50:
+                            print(f"  Warning: Large response ({size_mb:.1f}MB) for closed={closed_flag}, offset={offset}")
+                    
+                    # Try to parse JSON with memory error handling
+                    try:
+                        batch = response.json()
+                    except MemoryError:
+                        print(f"  MemoryError parsing response (closed={closed_flag}, offset={offset})")
+                        print(f"  Response size: {len(response.content) / (1024*1024):.1f}MB")
+                        print(f"  Reducing batch size and retrying...")
+                        # Reduce batch size and retry
+                        batch_size = max(10, batch_size // 2)
+                        print(f"  New batch size: {batch_size}")
+                        continue
+                    except json.JSONDecodeError as e:
+                        print(f"  JSON decode error (closed={closed_flag}, offset={offset}): {e}")
+                        print(f"  Response preview: {response.text[:500]}")
+                        break
 
                     if not batch:
-                        break
+                        consecutive_empty_batches += 1
+                        if consecutive_empty_batches >= max_consecutive_empty:
+                            print(f"  Stopping after {max_consecutive_empty} consecutive empty batches")
+                            break
+                        offset += batch_size  # Still increment offset to try next batch
+                        continue
+                    else:
+                        consecutive_empty_batches = 0  # Reset counter on successful batch
 
                     for m in batch:
                         vol = float(m.get("volume24hr", 0) or 0)
@@ -665,27 +708,42 @@ class DataFetcher:
 
                     offset += len(batch)
                     print(
-                        f"  Scanned {offset} markets (closed={closed_flag}), "
-                        f"found {len(markets_by_id)} with volume >= ${min_volume:,.0f}"
+                        f"  Scanned {offset:,} markets (closed={closed_flag}), "
+                        f"found {len(markets_by_id):,} with volume >= ${min_volume:,.0f}"
                     )
 
+                    # Stop if we got fewer markets than requested (end of results)
                     if len(batch) < batch_size:
+                        print(f"  Reached end of results (got {len(batch)} < {batch_size} markets)")
                         break
 
                 except requests.RequestException as e:
                     print(f"  Error fetching markets (closed={closed_flag}): {e}")
                     break
+                except MemoryError as e:
+                    print(f"  MemoryError fetching markets (closed={closed_flag}, offset={offset}): {e}")
+                    print(f"  Reducing batch size and retrying...")
+                    batch_size = max(10, batch_size // 2)
+                    print(f"  New batch size: {batch_size}")
+                    continue
 
         markets = list(markets_by_id.values())
         label = "active + closed" if include_closed else "active"
         print(f"  Found {len(markets)} {label} markets with volume >= ${min_volume:,.0f}")
 
+        # Warn if we got exactly 1000 markets (suspiciously round number)
+        if len(markets) == 1000 and max_markets is None:
+            print(f"  ⚠️  WARNING: Found exactly 1000 markets. This may indicate a pagination limit.")
+            print(f"     If you expected more markets, the API may have a limit or pagination issue.")
+
         if not markets:
             return 0
 
-        # Sort by volume and limit
+        # Sort by volume and limit (if max_markets specified)
         markets.sort(key=lambda x: x["volume24hr"], reverse=True)
-        markets = markets[:max_markets]
+        if max_markets is not None:
+            markets = markets[:max_markets]
+            print(f"  Limited to top {len(markets):,} markets by volume")
 
         # Concurrent fetch
         print(f"Fetching price history for {len(markets)} markets with {workers} workers...")
@@ -891,7 +949,13 @@ class DataFetcher:
                     continue
                 table = pa.table(cols)
                 filepath = out_dir / f"order_filled_{month}_part{part_seq:05d}.parquet"
-                pq.write_table(table, filepath, compression="snappy")
+                pq.write_table(
+                    table,
+                    filepath,
+                    compression="zstd",
+                    compression_level=3,
+                    row_group_size=500_000,  # Optimize row groups for predicate pushdown
+                )
                 part_seq += 1
                 total_rows += table.num_rows
 
@@ -1086,7 +1150,13 @@ class DataFetcher:
                 out_df = group.drop(columns=["month"])
                 table = pa.Table.from_pandas(out_df, preserve_index=False)
                 filepath = out_dir / f"trades_{month}_part{part_seq:05d}.parquet"
-                pq.write_table(table, filepath, compression="snappy")
+                pq.write_table(
+                    table,
+                    filepath,
+                    compression="zstd",
+                    compression_level=3,
+                    row_group_size=500_000,  # Optimize row groups for predicate pushdown
+                )
                 part_seq += 1
                 total_rows += table.num_rows
 

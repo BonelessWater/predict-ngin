@@ -20,6 +20,7 @@ from .data import (
 from .database import PredictionMarketDB, build_database
 from .fetcher import DataFetcher, ensure_data_exists
 from .parquet_store import TradeStore, PriceStore
+from .trade_price_store import TradeBasedPriceStore
 
 __all__ = [
     # Cost models
@@ -46,4 +47,5 @@ __all__ = [
     # Parquet stores
     "TradeStore",
     "PriceStore",
+    "TradeBasedPriceStore",
 ]

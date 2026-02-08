@@ -93,6 +93,16 @@ from .polymarket_backtest import (
     run_polymarket_backtest,
     print_polymarket_result,
 )
+from .momentum_signals import (
+    generate_momentum_signals,
+    generate_momentum_signals_parquet,
+    generate_momentum_signals_sqlite,
+    signals_dataframe_to_backtest_format,
+)
+from .momentum_signals_from_trades import (
+    generate_momentum_signals_from_trades,
+    trades_to_price_history,
+)
 
 __all__ = [
     "CostAssumptions",
@@ -173,4 +183,10 @@ __all__ = [
     "ClobPriceStore",
     "run_polymarket_backtest",
     "print_polymarket_result",
+    "generate_momentum_signals",
+    "generate_momentum_signals_parquet",
+    "generate_momentum_signals_sqlite",
+    "signals_dataframe_to_backtest_format",
+    "generate_momentum_signals_from_trades",
+    "trades_to_price_history",
 ]

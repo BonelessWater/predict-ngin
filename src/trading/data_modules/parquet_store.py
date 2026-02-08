@@ -14,6 +14,7 @@ Usage:
 from pathlib import Path
 import os
 from typing import List, Optional, Sequence
+from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
@@ -229,11 +230,16 @@ class TradeStore:
 
 
 class PriceStore:
-    """Load price data from monthly partitioned parquet files."""
+    """Load price data from monthly partitioned parquet files.
+    
+    Optimized for 100GB+ datasets using Polars lazy scanning and LRU caching.
+    """
 
-    def __init__(self, base_dir: Optional[str] = None):
+    def __init__(self, base_dir: Optional[str] = None, cache_size: int = 100):
         self.base_dir = Path(base_dir or f"{DEFAULT_PARQUET_DIR}/prices")
-        self._cache = {}
+        # Use OrderedDict for LRU cache with size limit to prevent memory issues
+        self._cache: OrderedDict = OrderedDict()
+        self._cache_size = cache_size
 
     def available(self) -> bool:
         """Check if parquet price files exist."""
@@ -246,6 +252,9 @@ class PriceStore:
     ) -> pd.DataFrame:
         """
         Load price history for a specific market and outcome.
+        
+        Optimized with Polars lazy scanning for 100GB+ datasets.
+        Uses predicate pushdown and column projection for minimal I/O.
 
         Args:
             market_id: Market identifier
@@ -256,9 +265,67 @@ class PriceStore:
             sorted by timestamp
         """
         cache_key = (str(market_id), outcome)
+        
+        # Check cache with LRU eviction
         if cache_key in self._cache:
-            return self._cache[cache_key]
+            # Move to end (most recently used) - OrderedDict maintains order
+            self._cache.move_to_end(cache_key)
+            return self._cache[cache_key].copy()
 
+        # Use Polars lazy scanning if available (much faster for large datasets)
+        if pl is not None:
+            try:
+                files = sorted(self.base_dir.glob("prices_*.parquet"))
+                if not files:
+                    result = pd.DataFrame(
+                        columns=["market_id", "outcome", "timestamp", "price"]
+                    )
+                else:
+                    # Lazy scan with predicate pushdown - only reads matching rows
+                    # This is MUCH faster than scanning all files with pandas
+                    lf = pl.concat([
+                        pl.scan_parquet(str(f))
+                        .filter(pl.col("market_id").cast(pl.Utf8, strict=False) == str(market_id))
+                        .filter(pl.col("outcome").cast(pl.Utf8, strict=False) == outcome.upper())
+                        for f in files
+                    ])
+                    
+                    # Only select needed columns (column projection)
+                    df = (
+                        lf.select(["market_id", "outcome", "timestamp", "price"])
+                        .sort("timestamp")
+                        .collect()
+                        .to_pandas()
+                    )
+                    
+                    # Ensure numeric types
+                    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+                    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+                    df = df.dropna(subset=["timestamp", "price"])
+                    df = df.sort_values("timestamp").reset_index(drop=True)
+                    
+                    result = df
+            except Exception as e:
+                # Fallback to pandas if Polars fails (e.g., schema issues)
+                result = self._get_price_history_pandas(market_id, outcome)
+        else:
+            # Fallback to pandas if Polars not available
+            result = self._get_price_history_pandas(market_id, outcome)
+
+        # Cache with LRU eviction
+        if len(self._cache) >= self._cache_size:
+            # Remove least recently used (first item in OrderedDict)
+            self._cache.popitem(last=False)
+        
+        self._cache[cache_key] = result
+        return result.copy()
+    
+    def _get_price_history_pandas(
+        self,
+        market_id: str,
+        outcome: str,
+    ) -> pd.DataFrame:
+        """Fallback pandas implementation for get_price_history."""
         dfs = []
         for f in sorted(self.base_dir.glob("prices_*.parquet")):
             try:
@@ -282,17 +349,15 @@ class PriceStore:
                     dfs.append(df)
 
         if not dfs:
-            result = pd.DataFrame(
+            return pd.DataFrame(
                 columns=["market_id", "outcome", "timestamp", "price"]
             )
-        else:
-            result = pd.concat(dfs, ignore_index=True)
-            result["timestamp"] = pd.to_numeric(result["timestamp"], errors="coerce")
-            result["price"] = pd.to_numeric(result["price"], errors="coerce")
-            result = result.dropna(subset=["timestamp", "price"])
-            result = result.sort_values("timestamp").reset_index(drop=True)
-
-        self._cache[cache_key] = result
+        
+        result = pd.concat(dfs, ignore_index=True)
+        result["timestamp"] = pd.to_numeric(result["timestamp"], errors="coerce")
+        result["price"] = pd.to_numeric(result["price"], errors="coerce")
+        result = result.dropna(subset=["timestamp", "price"])
+        result = result.sort_values("timestamp").reset_index(drop=True)
         return result
 
     def load_prices_for_markets(
@@ -302,6 +367,8 @@ class PriceStore:
     ) -> pd.DataFrame:
         """
         Load prices for multiple markets at once.
+        
+        Optimized with Polars lazy scanning for better performance.
 
         Args:
             market_ids: List of market identifiers
@@ -310,7 +377,43 @@ class PriceStore:
         Returns:
             DataFrame with price data for all specified markets
         """
+        if not market_ids:
+            return pd.DataFrame()
+        
         market_ids_str = [str(m) for m in market_ids]
+        
+        # Use Polars lazy scanning if available
+        if pl is not None:
+            try:
+                files = sorted(self.base_dir.glob("prices_*.parquet"))
+                if not files:
+                    return pd.DataFrame()
+                
+                # Lazy scan with predicate pushdown for multiple markets
+                lf = pl.concat([
+                    pl.scan_parquet(str(f))
+                    .filter(pl.col("market_id").cast(pl.Utf8, strict=False).is_in(market_ids_str))
+                    .filter(pl.col("outcome").cast(pl.Utf8, strict=False) == outcome.upper())
+                    for f in files
+                ])
+                
+                df = (
+                    lf.select(["market_id", "outcome", "timestamp", "price"])
+                    .sort("timestamp")
+                    .collect()
+                    .to_pandas()
+                )
+                
+                # Ensure numeric types
+                df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+                df["price"] = pd.to_numeric(df["price"], errors="coerce")
+                df = df.dropna(subset=["timestamp", "price"])
+                return df.sort_values("timestamp").reset_index(drop=True)
+            except Exception:
+                # Fallback to pandas
+                pass
+        
+        # Fallback to pandas implementation
         dfs = []
         for f in sorted(self.base_dir.glob("prices_*.parquet")):
             try:
