@@ -7,7 +7,7 @@ A backtesting framework for prediction market trading strategies, with whale ide
 - **Whale Identification**: Find profitable traders using multiple methods (win rate, volume, trade size)
 - **Backtesting Engine**: Event-driven backtest with realistic cost modeling
 - **Multi-Platform**: Supports Manifold Markets (play money) and Polymarket (USDC)
-- **SQLite Database**: Fast queries on 280M+ price points and 5M+ trades
+- **Parquet Storage**: Efficient columnar storage for 280M+ price points and 5M+ trades
 - **Real-Time Streaming**: WebSocket support for live Polymarket prices
 
 ## Quick Start
@@ -22,8 +22,8 @@ python run.py --method win_rate_60pct
 # Run Polymarket whale analysis
 python run.py --polymarket-whales
 
-# Build/update database from API data
-python run.py --build-db
+# Fetch data from APIs (stores in parquet format)
+python run.py --fetch-clob --clob-min-volume 5000 --clob-max-markets 500
 ```
 
 ## Project Structure
@@ -63,34 +63,66 @@ predict-ngin/
 |   `-- BACKTEST_ROADMAP.md
 |
 `-- data/                       # Data directory
-    |-- prediction_markets.db   # SQLite database (32GB)
+    |-- parquet/                # Parquet data files (primary storage)
+    |   |-- prices/             # Price history (monthly partitions)
+    |   |-- markets/            # Market metadata
+    |   `-- trades/             # Trade history (monthly partitions)
     `-- output/                 # Generated reports
 ```
 
-## Database
+## Data Storage
 
-All data is consolidated into a single SQLite database for fast querying.
+Data is stored in Parquet format (columnar storage) for efficient querying and analysis. Files are organized by type and partitioned by month for optimal performance.
 
-### Tables
+### Directory Structure
 
-| Table | Records | Description |
-|-------|---------|-------------|
-| `manifold_markets` | 174K | Manifold market metadata |
-| `manifold_bets` | 5M+ | Manifold trade history |
-| `polymarket_markets` | 2K | Polymarket market metadata |
-| `polymarket_prices` | 279M | CLOB price history |
-| `polymarket_trades` | 5.6M | Trade history |
+```
+data/
+|-- parquet/
+|   |-- prices/          # Price history (prices_YYYY-MM.parquet)
+|   |-- markets/         # Market metadata (markets_*.parquet)
+|   `-- trades/          # Trade history (trades_YYYY-MM_part*.parquet)
+`-- output/              # Generated reports
+```
 
-### Usage
+### Data Loading
 
 ```python
-from trading import PredictionMarketDB, load_markets, load_polymarket_markets
+from src.trading.data_modules.parquet_store import PriceStore, TradeStore
+from src.trading.data_modules.data import load_markets
 
-# Load data (auto-uses database)
-manifold_markets = load_markets()
-poly_markets = load_polymarket_markets()
+# Load markets
+markets = load_markets()  # Loads from parquet or JSON fallback
 
-# Direct database queries
+# Load price data
+price_store = PriceStore(base_dir="data/parquet/prices")
+prices_df = price_store.load_prices(
+    market_ids=["market_id_1", "market_id_2"],
+    start_date="2024-01-01",
+    end_date="2024-12-31"
+)
+
+# Load trade data
+trade_store = TradeStore(base_dir="data/parquet/trades")
+trades_df = trade_store.load_trades(
+    start_date="2024-01-01",
+    end_date="2024-12-31"
+)
+```
+
+### Optional: SQLite Database
+
+An optional SQLite database can be built from parquet files for SQL queries:
+
+```bash
+# Build database from parquet files (optional)
+python run.py --build-db
+```
+
+```python
+from src.trading.data_modules.database import PredictionMarketDB
+
+# Use database for SQL queries (if built)
 db = PredictionMarketDB()
 df = db.query("SELECT * FROM polymarket_trades WHERE usd_amount > 1000")
 prices = db.get_price_history("market_id", outcome="YES")
@@ -266,8 +298,8 @@ POLYMARKET_ADDRESS=...   # optional, if required by your API setup
 Examples:
 
 ```bash
-# Load whales from DB (top 25 by volume)
-python scripts/monitoring/live_whale_tracker.py --db-path data/prediction_markets.db --max-whales 25
+# Load whales from parquet trades (top 25 by volume)
+python scripts/monitoring/live_whale_tracker.py --max-whales 25
 
 # Use a watchlist file (one address per line)
 python scripts/monitoring/live_whale_tracker.py --whales-file data/whales.txt --min-usd 1000 --role taker
@@ -298,8 +330,8 @@ python run.py --rolling --lookback 3
 
 # Data management
 python run.py --fetch              # Fetch Manifold data
-python run.py --fetch-clob         # Fetch Polymarket CLOB data
-python run.py --build-db           # Build SQLite database
+python run.py --fetch-clob         # Fetch Polymarket CLOB data (stores in parquet)
+python run.py --build-db           # Build optional SQLite database from parquet files
 
 # Polymarket analysis
 python run.py --polymarket-whales
@@ -327,7 +359,6 @@ python run.py --polymarket-whales
 
 - [Whale Strategy Research Report](docs/WHALE_STRATEGY_RESEARCH_REPORT.md) - Full analysis
 - [Backtest Roadmap](docs/BACKTEST_ROADMAP.md) - Building production backtester
-- [Data README](data/README.md) - Database schema and usage
 
 ## License
 

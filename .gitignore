@@ -3,6 +3,7 @@ venv
 
 .env
 requirements-dev.txt
+.coverage
 
 # Agents
 AGENTS.md

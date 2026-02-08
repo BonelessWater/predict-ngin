@@ -51,6 +51,20 @@ def trades_to_price_history(
         else:
             raise ValueError("Trades must have 'price' or ('usd_amount' + 'token_amount')")
     
+    # Add outcome column if missing
+    if "outcome" not in df.columns:
+        # Try to infer from maker_direction or taker_direction
+        if "maker_direction" in df.columns:
+            df["outcome"] = df["maker_direction"].str.upper()
+            # Normalize: if it's buy/sell or other values, default to YES
+            df.loc[~df["outcome"].isin(["YES", "NO"]), "outcome"] = "YES"
+        elif "taker_direction" in df.columns:
+            df["outcome"] = df["taker_direction"].str.upper()
+            df.loc[~df["outcome"].isin(["YES", "NO"]), "outcome"] = "YES"
+        else:
+            # No direction info, default to YES
+            df["outcome"] = "YES"
+    
     # Filter by outcome if specified
     if "outcome" in df.columns:
         df = df[df["outcome"].str.upper() == outcome.upper()]
@@ -59,6 +73,7 @@ def trades_to_price_history(
     if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     
+    # Drop rows missing required columns (outcome is now guaranteed to exist)
     df = df.dropna(subset=["market_id", "outcome", "timestamp", "price"])
     
     if df.empty:
@@ -81,7 +96,7 @@ def generate_momentum_signals_from_trades(
     eval_freq_hours: int = 24,
     outcome: str = "YES",
     position_size: Optional[float] = None,
-    max_markets: Optional[int] = None,
+    max_markets: Optional[int] = 1000,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> pd.DataFrame:
@@ -97,7 +112,7 @@ def generate_momentum_signals_from_trades(
         eval_freq_hours: Evaluation frequency in hours (default: 24 = daily)
         outcome: Outcome to trade (YES/NO)
         position_size: Optional position size for signals
-        max_markets: Optional limit on number of markets
+        max_markets: Limit on number of markets (default: 1000)
         start_date: Optional start date filter (YYYY-MM-DD)
         end_date: Optional end date filter (YYYY-MM-DD)
         

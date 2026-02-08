@@ -91,8 +91,8 @@ def main() -> int:
     parser.add_argument(
         "--max-markets",
         type=int,
-        default=None,
-        help="Cap number of markets (for faster runs)",
+        default=1000,
+        help="Cap number of markets (default: 1000)",
     )
     parser.add_argument(
         "--output-dir",

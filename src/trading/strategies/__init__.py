@@ -48,6 +48,11 @@ try:
 except ImportError:  # pragma: no cover - optional strategy module
     SentimentDivergenceStrategy = None
 
+try:
+    from .nlp_correlation import NLPCorrelationStrategy
+except ImportError:  # pragma: no cover - optional strategy module
+    NLPCorrelationStrategy = None
+
 # New strategies will be imported here as they're created
 
 __all__ = [
@@ -65,6 +70,7 @@ _optional = {
     "VolatilityBreakoutStrategy": VolatilityBreakoutStrategy,
     "TimeDecayStrategy": TimeDecayStrategy,
     "SentimentDivergenceStrategy": SentimentDivergenceStrategy,
+    "NLPCorrelationStrategy": NLPCorrelationStrategy,
 }
 for _name, _value in _optional.items():
     if _value is not None:

@@ -13,6 +13,10 @@ websockets>=12.0
 # Statistical analysis
 scipy>=1.10.0
 
+# NLP (for NLP correlation strategy)
+scikit-learn>=1.3.0  # Optional: for TF-IDF similarity
+# sentence-transformers>=2.2.0  # Optional: for embedding-based similarity
+
 # Performance reporting
 quantstats>=0.0.62
 

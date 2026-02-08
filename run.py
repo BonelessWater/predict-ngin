@@ -584,7 +584,13 @@ Examples:
         "--clob-max-markets",
         type=int,
         default=500,
-        help="Maximum markets to fetch CLOB data for (default: 500)",
+        help="Maximum markets to fetch CLOB data for (default: 500, ignored if --clob-markets-parquet provided)",
+    )
+    parser.add_argument(
+        "--clob-markets-parquet",
+        type=str,
+        default=None,
+        help="Path to markets.parquet file to use instead of fetching from API (default: None)",
     )
     parser.add_argument(
         "--build-db",
@@ -695,7 +701,8 @@ Examples:
             # Only fetch CLOB data
             fetcher.fetch_polymarket_clob_data(
                 min_volume=args.clob_min_volume,
-                max_markets=args.clob_max_markets,
+                max_markets=args.clob_max_markets if not args.clob_markets_parquet else None,
+                markets_parquet_path=args.clob_markets_parquet,
             )
             if not args.fetch and not args.fetch_only:
                 print("\nCLOB fetch complete.")

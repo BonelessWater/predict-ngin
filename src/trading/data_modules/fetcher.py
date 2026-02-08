@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Set
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
 import threading
+import sys
+
+import pandas as pd
 
 
 # API endpoints
@@ -458,6 +462,112 @@ class DataFetcher:
             return None
         return None
 
+    def _load_markets_from_parquet(
+        self,
+        parquet_path: str,
+        min_volume: float = 0,
+        include_closed: bool = True,
+        max_markets: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        Load markets from parquet file and convert to expected format.
+        
+        Args:
+            parquet_path: Path to markets.parquet file
+            min_volume: Minimum volume filter (default: 0 = no filter)
+            include_closed: Include closed markets (default: True)
+            max_markets: Maximum markets to return (default: None = all)
+            
+        Returns:
+            DataFrame with markets in expected format
+        """
+        parquet_file = Path(parquet_path)
+        if not parquet_file.exists():
+            raise FileNotFoundError(f"Markets parquet file not found: {parquet_path}")
+        
+        print(f"Loading markets from {parquet_path}...")
+        df = pd.read_parquet(parquet_file)
+        print(f"  Loaded {len(df):,} markets from parquet")
+        
+        # Filter by closed status
+        if not include_closed:
+            if "closed" in df.columns:
+                df = df[df["closed"] == False]
+                print(f"  Filtered to {len(df):,} active markets")
+            # If "closed" column doesn't exist, assume all markets are active (don't filter)
+        
+        # Filter by volume (convert volume column to float)
+        if min_volume > 0:
+            if "volume" in df.columns:
+                df["volume_float"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+                df = df[df["volume_float"] >= min_volume]
+                print(f"  Filtered to {len(df):,} markets with volume >= ${min_volume:,.0f}")
+        
+        # Map columns to expected format
+        markets_list = []
+        for _, row in df.iterrows():
+            # Extract token IDs
+            token_ids = []
+            if pd.notna(row.get("token1")):
+                token_ids.append(str(row["token1"]))
+            if pd.notna(row.get("token2")):
+                token_ids.append(str(row["token2"]))
+            
+            # Skip if no tokens
+            if not token_ids:
+                continue
+            
+            # Parse outcomes
+            outcomes = []
+            outcome_prices = []
+            if pd.notna(row.get("answer1")):
+                outcomes.append(str(row["answer1"]))
+            if pd.notna(row.get("answer2")):
+                outcomes.append(str(row["answer2"]))
+            
+            # Parse outcome prices if available
+            if pd.notna(row.get("outcome_prices")):
+                try:
+                    import ast
+                    prices_str = str(row["outcome_prices"])
+                    if prices_str.startswith('[') and prices_str.endswith(']'):
+                        outcome_prices = ast.literal_eval(prices_str)
+                    else:
+                        outcome_prices = [0, 0]
+                except:
+                    outcome_prices = [0, 0]
+            
+            # Get volume (prefer volume_float if we created it, otherwise parse)
+            volume_val = row.get("volume_float", 0)
+            if volume_val == 0 and pd.notna(row.get("volume")):
+                volume_val = pd.to_numeric(row["volume"], errors="coerce")
+                if pd.isna(volume_val):
+                    volume_val = 0
+            
+            market = {
+                "id": str(row["id"]),
+                "question": str(row.get("question", ""))[:100],
+                "slug": str(row.get("slug", "")),
+                "token_ids": token_ids,
+                "volume24hr": float(volume_val),  # Use total volume as proxy for 24hr volume
+                "volume": float(volume_val),
+                "liquidity": float(pd.to_numeric(row.get("liquidity", 0), errors="coerce") or 0),
+                "outcomes": outcomes,
+                "outcomePrices": outcome_prices,
+                "endDate": str(row.get("end_date", "")),
+            }
+            markets_list.append(market)
+        
+        result_df = pd.DataFrame(markets_list)
+        
+        # Sort by volume and limit if requested
+        if len(result_df) > 0:
+            result_df = result_df.sort_values("volume24hr", ascending=False)
+            if max_markets is not None:
+                result_df = result_df.head(max_markets)
+        
+        return result_df
+
     def _append_markets_parquet(self, markets: List[Dict[str, Any]], markets_dir: Path) -> int:
         if not markets:
             return 0
@@ -546,6 +656,131 @@ class DataFetcher:
 
         return all_history
 
+    def _load_checkpoint(self, checkpoint_path: Path) -> Set[str]:
+        """Load processed market IDs from checkpoint file."""
+        if checkpoint_path.exists():
+            try:
+                with open(checkpoint_path, 'r') as f:
+                    checkpoint = json.load(f)
+                    processed_ids = set(checkpoint.get("processed_market_ids", []))
+                    print(f"  Loaded checkpoint: {len(processed_ids):,} markets already processed")
+                    return processed_ids
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"  Warning: Could not load checkpoint: {e}")
+        return set()
+
+    def _save_checkpoint(self, checkpoint_path: Path, processed_ids: Set[str], last_market_id: Optional[str] = None) -> None:
+        """Save checkpoint with processed market IDs."""
+        try:
+            checkpoint = {
+                "processed_market_ids": sorted(list(processed_ids)),
+                "last_market_id": last_market_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            # Write to temp file first, then rename (atomic on most filesystems)
+            temp_path = checkpoint_path.with_suffix('.tmp')
+            with open(temp_path, 'w') as f:
+                json.dump(checkpoint, f, indent=2)
+            temp_path.replace(checkpoint_path)
+        except IOError as e:
+            print(f"  Warning: Could not save checkpoint: {e}")
+
+    def _append_to_parquet(
+        self,
+        new_data: pd.DataFrame,
+        filepath: Path,
+    ) -> None:
+        """Append new data to existing parquet file, or create new file if it doesn't exist.
+        
+        Note: For very large existing files, this reads the entire file into memory.
+        Since we flush frequently, files should remain manageable in size.
+        """
+        try:
+            from trading.data_modules.parquet_utils import write_prices_optimized
+            USE_OPTIMIZED = True
+        except ImportError:
+            USE_OPTIMIZED = False
+            import pyarrow.parquet as pq
+            import pyarrow as pa
+
+        if new_data.empty:
+            return
+
+        # Read existing data if file exists
+        if filepath.exists():
+            try:
+                # Check file size (warn if > 500MB uncompressed)
+                file_size_mb = filepath.stat().st_size / (1024 * 1024)
+                if file_size_mb > 500:
+                    print(f"    Warning: Large parquet file {filepath.name} ({file_size_mb:.1f}MB). Reading may use significant memory.")
+                
+                existing_df = pd.read_parquet(filepath)
+                # Combine and deduplicate (in case of resume)
+                combined_df = pd.concat([existing_df, new_data], ignore_index=True)
+                # Remove duplicates based on (market_id, outcome, timestamp)
+                combined_df = combined_df.drop_duplicates(
+                    subset=["market_id", "outcome", "timestamp"],
+                    keep="last"  # Keep newer data if duplicates exist
+                )
+            except MemoryError as e:
+                print(f"    Error: Memory error reading {filepath.name}. File may be too large.")
+                print(f"    Consider reducing flush_interval or max_memory_rows to flush more frequently.")
+                raise
+            except Exception as e:
+                print(f"    Warning: Could not read existing parquet {filepath.name}: {e}")
+                combined_df = new_data
+        else:
+            combined_df = new_data
+
+        # Sort and write
+        combined_df = combined_df.sort_values(["market_id", "outcome", "timestamp"]).reset_index(drop=True)
+
+        if USE_OPTIMIZED:
+            write_prices_optimized(combined_df, filepath)
+        else:
+            try:
+                table = pa.Table.from_pandas(combined_df, preserve_index=False)
+                pq.write_table(
+                    table,
+                    filepath,
+                    compression="zstd",
+                    compression_level=3,
+                    row_group_size=500_000,
+                )
+            except ImportError:
+                combined_df.to_parquet(filepath, index=False, compression="snappy")
+
+    def _flush_monthly_data(
+        self,
+        monthly_data: Dict[str, List[Dict[str, Any]]],
+        parquet_dir: Path,
+        lock: Optional[threading.Lock] = None,
+    ) -> Tuple[int, int]:
+        """Flush accumulated monthly data to parquet files."""
+        if lock:
+            with lock:
+                # Copy data to avoid holding lock during I/O
+                data_to_flush = {k: list(v) for k, v in monthly_data.items()}
+                monthly_data.clear()
+        else:
+            data_to_flush = monthly_data
+            monthly_data.clear()
+
+        written_files = 0
+        total_rows = 0
+
+        for month, rows in data_to_flush.items():
+            if not rows:
+                continue
+
+            df = pd.DataFrame(rows)
+            output_file = parquet_dir / f"prices_{month}.parquet"
+            self._append_to_parquet(df, output_file)
+            written_files += 1
+            total_rows += len(rows)
+
+        return written_files, total_rows
+
     def _fetch_single_market_history(
         self,
         market: Dict[str, Any],
@@ -553,14 +788,14 @@ class DataFetcher:
         max_days: int,
         progress: Dict[str, int],
         lock: threading.Lock,
+        monthly_data: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> Tuple[bool, int]:
-        """Fetch price history for a single market (thread-safe)."""
+        """Fetch price history for a single market (thread-safe).
+        
+        Accumulates price data in monthly_data dict for parquet writing.
+        """
         try:
-            market_data = {
-                "market_info": market,
-                "price_history": {},
-            }
-
+            market_id = str(market["id"])
             total_points = 0
 
             # Fetch history for each token (YES/NO outcomes)
@@ -570,20 +805,28 @@ class DataFetcher:
                     max_days=max_days,
                 )
                 outcome = "YES" if j == 0 else "NO"
-                market_data["price_history"][outcome] = {
-                    "token_id": token_id,
-                    "history": history,
-                    "data_points": len(history),
-                }
+                
+                # Accumulate price data grouped by month
+                if monthly_data is not None:
+                    for point in history:
+                        ts = point.get("t", 0)
+                        price = point.get("p", 0)
+                        if ts and price:
+                            # Convert timestamp to date for grouping
+                            try:
+                                date_str = pd.Timestamp(ts, unit="s").strftime("%Y-%m")
+                                with lock:
+                                    monthly_data[date_str].append({
+                                        "market_id": market_id,
+                                        "outcome": outcome,
+                                        "timestamp": ts,
+                                        "price": price,
+                                    })
+                            except (ValueError, OSError):
+                                # Skip invalid timestamps
+                                continue
+                
                 total_points += len(history)
-
-            # Save individual market file
-            safe_slug = market["slug"][:50] if market["slug"] else str(market["id"])
-            safe_slug = "".join(c if c.isalnum() or c == "-" else "_" for c in safe_slug)
-            self._save_json(
-                market_data,
-                output_dir / f"market_{safe_slug}.json"
-            )
 
             with lock:
                 progress["fetched"] += 1
@@ -605,179 +848,292 @@ class DataFetcher:
         max_days: int = 1180,  # Default: ~3.2 years (matches existing trades data: Nov 21, 2022 - Dec 30, 2025)
         workers: int = MAX_WORKERS,
         include_closed: bool = True,  # Default: include closed markets for maximum historical data
+        markets_parquet_path: Optional[str] = None,  # Path to markets.parquet file
+        flush_interval: int = 50,  # Flush every N markets
+        max_memory_rows: int = 1_000_000,  # Flush when accumulator exceeds this many rows
     ) -> int:
         """
-        Fetch historical price data for Polymarket markets (concurrent).
+        Fetch historical price data for Polymarket markets with memory management and resumability.
+        
+        Writes price data directly to monthly parquet partitions instead of JSON.
+        Supports checkpoint/resume: if interrupted, can continue where it left off.
+        Flushes data periodically to avoid memory issues.
+        
+        If markets_parquet_path is provided, loads markets from parquet file instead of API.
 
         Args:
             min_volume: Minimum 24hr volume to include market (default: 10000 = $10k)
-            max_markets: Maximum number of markets to fetch (default: None = unlimited)
+            max_markets: Maximum number of markets to fetch (default: None = unlimited, ignored if markets_parquet_path provided)
             max_days: Days of history per market (default: 1180 = ~3.2 years, matches existing trades data: Nov 21, 2022 - Dec 30, 2025)
             workers: Number of concurrent workers (default: 20)
             include_closed: Include closed markets in the scan (default: True for maximum historical data)
+            markets_parquet_path: Path to markets.parquet file (default: None = fetch from API)
+            flush_interval: Flush data to disk every N markets (default: 50)
+            max_memory_rows: Maximum rows to accumulate before flushing (default: 1,000,000)
 
         Returns:
             Total markets fetched
         """
-        output_dir = self.data_dir / "polymarket_clob"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        self._require_pyarrow()
+        
+        # Output to parquet directory instead of JSON
+        parquet_dir = self.data_dir / "parquet" / "prices"
+        parquet_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Keep market metadata in JSON for now (small, easy to query)
+        metadata_dir = self.data_dir / "polymarket_clob"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
 
-        # First, get list of markets with volume
-        print("Fetching Polymarket markets...")
-        markets_by_id: Dict[str, Dict[str, Any]] = {}
-        # Use smaller batch size for closed markets to avoid memory issues
-        batch_size = 50 if include_closed else 100
-        closed_flags = ["false", "true"] if include_closed else ["false"]
+        # Checkpoint file for resumability
+        checkpoint_path = metadata_dir / "price_fetch_checkpoint.json"
 
-        for closed_flag in closed_flags:
-            offset = 0
-            consecutive_empty_batches = 0
-            max_consecutive_empty = 3  # Stop after 3 empty batches in a row
-            # Fetch enough markets: if max_markets specified, fetch 2x to filter; otherwise fetch all
-            target_count = (max_markets * 2) if max_markets else float('inf')
-            while len(markets_by_id) < target_count:
-                self._rate_limit()
-                try:
-                    response = self.session.get(
-                        f"{POLYMARKET_API}/markets",
-                        params={
-                            "limit": batch_size,
-                            "offset": offset,
-                            "closed": closed_flag,
-                        },
-                        timeout=60,  # Increase timeout for large responses
-                    )
-                    response.raise_for_status()
-                    
-                    # Check response size before parsing (warn if > 50MB)
-                    content_length = response.headers.get('content-length')
-                    if content_length:
-                        size_mb = int(content_length) / (1024 * 1024)
-                        if size_mb > 50:
-                            print(f"  Warning: Large response ({size_mb:.1f}MB) for closed={closed_flag}, offset={offset}")
-                    
-                    # Try to parse JSON with memory error handling
+        # Load checkpoint to resume if interrupted
+        processed_market_ids = self._load_checkpoint(checkpoint_path)
+
+        # Load markets from parquet file if provided, otherwise fetch from API
+        if markets_parquet_path:
+            markets_df = self._load_markets_from_parquet(markets_parquet_path, min_volume, include_closed, max_markets)
+            markets = markets_df.to_dict('records')
+            print(f"Loaded {len(markets):,} markets from {markets_parquet_path}")
+            
+            # Filter out already-processed markets
+            if processed_market_ids:
+                original_count = len(markets)
+                markets = [m for m in markets if str(m["id"]) not in processed_market_ids]
+                skipped = original_count - len(markets)
+                if skipped > 0:
+                    print(f"  Resuming: Skipping {skipped:,} already-processed markets")
+        else:
+            # First, get list of markets with volume from API
+            print("Fetching Polymarket markets from API...")
+            markets_by_id: Dict[str, Dict[str, Any]] = {}
+            # Use smaller batch size for closed markets to avoid memory issues
+            batch_size = 50 if include_closed else 100
+            closed_flags = ["false", "true"] if include_closed else ["false"]
+
+            for closed_flag in closed_flags:
+                offset = 0
+                consecutive_empty_batches = 0
+                max_consecutive_empty = 3  # Stop after 3 empty batches in a row
+                # Fetch enough markets: if max_markets specified, fetch 2x to filter; otherwise fetch all
+                target_count = (max_markets * 2) if max_markets else float('inf')
+                while len(markets_by_id) < target_count:
+                    self._rate_limit()
                     try:
-                        batch = response.json()
-                    except MemoryError:
-                        print(f"  MemoryError parsing response (closed={closed_flag}, offset={offset})")
-                        print(f"  Response size: {len(response.content) / (1024*1024):.1f}MB")
+                        response = self.session.get(
+                            f"{POLYMARKET_API}/markets",
+                            params={
+                                "limit": batch_size,
+                                "offset": offset,
+                                "closed": closed_flag,
+                            },
+                            timeout=60,  # Increase timeout for large responses
+                        )
+                        response.raise_for_status()
+                        
+                        # Check response size before parsing (warn if > 50MB)
+                        content_length = response.headers.get('content-length')
+                        if content_length:
+                            size_mb = int(content_length) / (1024 * 1024)
+                            if size_mb > 50:
+                                print(f"  Warning: Large response ({size_mb:.1f}MB) for closed={closed_flag}, offset={offset}")
+                        
+                        # Try to parse JSON with memory error handling
+                        try:
+                            batch = response.json()
+                        except MemoryError:
+                            print(f"  MemoryError parsing response (closed={closed_flag}, offset={offset})")
+                            print(f"  Response size: {len(response.content) / (1024*1024):.1f}MB")
+                            print(f"  Reducing batch size and retrying...")
+                            # Reduce batch size and retry
+                            batch_size = max(10, batch_size // 2)
+                            print(f"  New batch size: {batch_size}")
+                            continue
+                        except json.JSONDecodeError as e:
+                            print(f"  JSON decode error (closed={closed_flag}, offset={offset}): {e}")
+                            print(f"  Response preview: {response.text[:500]}")
+                            break
+
+                        if not batch:
+                            consecutive_empty_batches += 1
+                            if consecutive_empty_batches >= max_consecutive_empty:
+                                print(f"  Stopping after {max_consecutive_empty} consecutive empty batches")
+                                break
+                            offset += batch_size  # Still increment offset to try next batch
+                            continue
+                        else:
+                            consecutive_empty_batches = 0  # Reset counter on successful batch
+
+                        for m in batch:
+                            vol = float(m.get("volume24hr", 0) or 0)
+                            tokens = m.get("clobTokenIds", "[]")
+                            if isinstance(tokens, str):
+                                try:
+                                    tokens = json.loads(tokens)
+                                except json.JSONDecodeError:
+                                    tokens = []
+
+                            if vol >= min_volume and tokens:
+                                market_id = str(m.get("id"))
+                                # Skip if already processed
+                                if market_id not in processed_market_ids:
+                                    markets_by_id[market_id] = {
+                                        "id": m.get("id"),
+                                        "question": m.get("question", "")[:100],
+                                        "slug": m.get("slug"),
+                                        "token_ids": tokens,
+                                        "volume24hr": vol,
+                                        "volume": float(m.get("volume", 0) or 0),
+                                        "liquidity": float(m.get("liquidity", 0) or 0),
+                                        "outcomes": m.get("outcomes"),
+                                        "outcomePrices": m.get("outcomePrices"),
+                                        "endDate": m.get("endDate"),
+                                    }
+
+                        offset += len(batch)
+                        print(
+                            f"  Scanned {offset:,} markets (closed={closed_flag}), "
+                            f"found {len(markets_by_id):,} with volume >= ${min_volume:,.0f}"
+                        )
+
+                        # Stop if we got fewer markets than requested (end of results)
+                        if len(batch) < batch_size:
+                            print(f"  Reached end of results (got {len(batch)} < {batch_size} markets)")
+                            break
+
+                    except requests.RequestException as e:
+                        print(f"  Error fetching markets (closed={closed_flag}): {e}")
+                        break
+                    except MemoryError as e:
+                        print(f"  MemoryError fetching markets (closed={closed_flag}, offset={offset}): {e}")
                         print(f"  Reducing batch size and retrying...")
-                        # Reduce batch size and retry
                         batch_size = max(10, batch_size // 2)
                         print(f"  New batch size: {batch_size}")
                         continue
-                    except json.JSONDecodeError as e:
-                        print(f"  JSON decode error (closed={closed_flag}, offset={offset}): {e}")
-                        print(f"  Response preview: {response.text[:500]}")
-                        break
 
-                    if not batch:
-                        consecutive_empty_batches += 1
-                        if consecutive_empty_batches >= max_consecutive_empty:
-                            print(f"  Stopping after {max_consecutive_empty} consecutive empty batches")
-                            break
-                        offset += batch_size  # Still increment offset to try next batch
-                        continue
-                    else:
-                        consecutive_empty_batches = 0  # Reset counter on successful batch
+            markets = list(markets_by_id.values())
+            label = "active + closed" if include_closed else "active"
+            print(f"  Found {len(markets)} {label} markets with volume >= ${min_volume:,.0f}")
 
-                    for m in batch:
-                        vol = float(m.get("volume24hr", 0) or 0)
-                        tokens = m.get("clobTokenIds", "[]")
-                        if isinstance(tokens, str):
-                            try:
-                                tokens = json.loads(tokens)
-                            except json.JSONDecodeError:
-                                tokens = []
+            # Warn if we got exactly 1000 markets (suspiciously round number)
+            if len(markets) == 1000 and max_markets is None:
+                print(f"  ⚠️  WARNING: Found exactly 1000 markets. This may indicate a pagination limit.")
+                print(f"     If you expected more markets, the API may have a limit or pagination issue.")
 
-                        if vol >= min_volume and tokens:
-                            market_id = str(m.get("id"))
-                            markets_by_id[market_id] = {
-                                "id": m.get("id"),
-                                "question": m.get("question", "")[:100],
-                                "slug": m.get("slug"),
-                                "token_ids": tokens,
-                                "volume24hr": vol,
-                                "volume": float(m.get("volume", 0) or 0),
-                                "liquidity": float(m.get("liquidity", 0) or 0),
-                                "outcomes": m.get("outcomes"),
-                                "outcomePrices": m.get("outcomePrices"),
-                                "endDate": m.get("endDate"),
-                            }
+            if not markets:
+                return 0
 
-                    offset += len(batch)
-                    print(
-                        f"  Scanned {offset:,} markets (closed={closed_flag}), "
-                        f"found {len(markets_by_id):,} with volume >= ${min_volume:,.0f}"
-                    )
-
-                    # Stop if we got fewer markets than requested (end of results)
-                    if len(batch) < batch_size:
-                        print(f"  Reached end of results (got {len(batch)} < {batch_size} markets)")
-                        break
-
-                except requests.RequestException as e:
-                    print(f"  Error fetching markets (closed={closed_flag}): {e}")
-                    break
-                except MemoryError as e:
-                    print(f"  MemoryError fetching markets (closed={closed_flag}, offset={offset}): {e}")
-                    print(f"  Reducing batch size and retrying...")
-                    batch_size = max(10, batch_size // 2)
-                    print(f"  New batch size: {batch_size}")
-                    continue
-
-        markets = list(markets_by_id.values())
-        label = "active + closed" if include_closed else "active"
-        print(f"  Found {len(markets)} {label} markets with volume >= ${min_volume:,.0f}")
-
-        # Warn if we got exactly 1000 markets (suspiciously round number)
-        if len(markets) == 1000 and max_markets is None:
-            print(f"  ⚠️  WARNING: Found exactly 1000 markets. This may indicate a pagination limit.")
-            print(f"     If you expected more markets, the API may have a limit or pagination issue.")
+            # Sort by volume and limit (if max_markets specified)
+            markets.sort(key=lambda x: x.get("volume24hr", 0), reverse=True)
+            if max_markets is not None:
+                markets = markets[:max_markets]
+                print(f"  Limited to top {len(markets):,} markets by volume")
 
         if not markets:
-            return 0
+            if processed_market_ids:
+                print(f"  All markets already processed. Total: {len(processed_market_ids):,}")
+            return len(processed_market_ids)
 
-        # Sort by volume and limit (if max_markets specified)
-        markets.sort(key=lambda x: x["volume24hr"], reverse=True)
-        if max_markets is not None:
-            markets = markets[:max_markets]
-            print(f"  Limited to top {len(markets):,} markets by volume")
-
-        # Concurrent fetch
-        print(f"Fetching price history for {len(markets)} markets with {workers} workers...")
+        # Process markets sequentially in batches with periodic flushing
+        print(f"Fetching price history for {len(markets)} markets...")
+        print(f"  Writing to parquet: {parquet_dir}")
+        print(f"  Flush interval: every {flush_interval} markets or {max_memory_rows:,} rows")
 
         progress = {"fetched": 0, "errors": 0, "total_points": 0, "total": len(markets)}
         lock = threading.Lock()
+        
+        # Thread-safe accumulator for monthly price data
+        monthly_data: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(
-                    self._fetch_single_market_history,
-                    market,
-                    output_dir,
-                    max_days,
-                    progress,
-                    lock,
-                ): market
-                for market in markets
-            }
+        # Process markets in batches to enable checkpointing
+        batch_size = min(workers, flush_interval)
+        total_flushed = 0
+        markets_processed_since_flush = 0
 
-            for future in as_completed(futures):
-                # Results are tracked via progress dict
-                pass
+        try:
+            for batch_start in range(0, len(markets), batch_size):
+                batch_markets = markets[batch_start:batch_start + batch_size]
+                
+                # Fetch batch concurrently
+                with ThreadPoolExecutor(max_workers=min(workers, len(batch_markets))) as executor:
+                    futures = {
+                        executor.submit(
+                            self._fetch_single_market_history,
+                            market,
+                            metadata_dir,
+                            max_days,
+                            progress,
+                            lock,
+                            monthly_data,
+                        ): market
+                        for market in batch_markets
+                    }
 
-        # Save market index
+                    for future in as_completed(futures):
+                        market = futures[future]
+                        market_id = str(market["id"])
+                        try:
+                            success, points = future.result()
+                            if success:
+                                processed_market_ids.add(market_id)
+                                markets_processed_since_flush += 1
+                        except Exception as e:
+                            print(f"  Error processing market {market_id}: {e}")
+                            with lock:
+                                progress["errors"] += 1
+
+                # Check if we should flush (by count or memory)
+                with lock:
+                    total_rows = sum(len(rows) for rows in monthly_data.values())
+                should_flush = (
+                    (markets_processed_since_flush >= flush_interval) or
+                    (total_rows >= max_memory_rows)
+                )
+
+                if should_flush and monthly_data:
+                    written_files, flushed_rows = self._flush_monthly_data(monthly_data, parquet_dir, lock)
+                    total_flushed += flushed_rows
+                    print(f"  Flushed {flushed_rows:,} rows to {written_files} parquet files (total: {progress['fetched']}/{progress['total']} markets)")
+                    markets_processed_since_flush = 0
+                    
+                    # Save checkpoint after flush
+                    last_market_id = str(batch_markets[-1]["id"]) if batch_markets else None
+                    self._save_checkpoint(checkpoint_path, processed_market_ids, last_market_id)
+
+        except KeyboardInterrupt:
+            print("\n  Interrupted by user. Flushing accumulated data...")
+            # Flush remaining data
+            if monthly_data:
+                written_files, flushed_rows = self._flush_monthly_data(monthly_data, parquet_dir, lock)
+                total_flushed += flushed_rows
+                print(f"  Flushed {flushed_rows:,} rows before exit")
+            # Save checkpoint
+            self._save_checkpoint(checkpoint_path, processed_market_ids)
+            print(f"  Checkpoint saved. Processed {len(processed_market_ids):,} markets.")
+            print(f"  To resume, run the same command again.")
+            raise
+
+        # Final flush of any remaining data
+        if monthly_data:
+            written_files, flushed_rows = self._flush_monthly_data(monthly_data, parquet_dir)
+            total_flushed += flushed_rows
+            print(f"  Final flush: {flushed_rows:,} rows")
+
+        # Save final checkpoint
+        self._save_checkpoint(checkpoint_path, processed_market_ids)
+        
+        # Save market index (metadata)
+        all_markets = markets + [{"id": mid} for mid in processed_market_ids if mid not in {str(m["id"]) for m in markets}]
         index = [{
-            "id": m["id"],
-            "slug": m["slug"],
-            "question": m["question"],
-            "volume24hr": m["volume24hr"],
-        } for m in markets]
-        self._save_json(index, output_dir / "market_index.json")
+            "id": m.get("id", m),
+            "slug": m.get("slug", ""),
+            "question": m.get("question", "")[:100],
+            "volume24hr": m.get("volume24hr", 0),
+        } for m in all_markets if isinstance(m, dict)]
+        self._save_json(index, metadata_dir / "market_index.json")
 
         print(f"\n  Complete: {progress['fetched']} markets, {progress['total_points']:,} data points")
+        print(f"  Written: {total_flushed:,} total rows to parquet files")
         if progress["errors"] > 0:
             print(f"  Errors: {progress['errors']}")
 
@@ -1291,16 +1647,20 @@ if __name__ == "__main__":
         # Fetch CLOB price history
         print("Fetching Polymarket CLOB price history...")
         min_vol = float(sys.argv[2]) if len(sys.argv) > 2 else 10000
-        max_mkts = int(sys.argv[3]) if len(sys.argv) > 3 else 100
-        max_days = int(sys.argv[4]) if len(sys.argv) > 4 else 90
-        include_closed = False
+        max_mkts_str = sys.argv[3] if len(sys.argv) > 3 else "None"
+        max_mkts = None if max_mkts_str.lower() == "none" else int(max_mkts_str)
+        max_days = int(sys.argv[4]) if len(sys.argv) > 4 else 1180
+        include_closed = True
         if len(sys.argv) > 5:
             include_closed = str(sys.argv[5]).strip().lower() in {"1", "true", "yes", "y", "on"}
+        markets_parquet = sys.argv[6] if len(sys.argv) > 6 else None
+        
         fetcher.fetch_polymarket_clob_data(
             min_volume=min_vol,
-            max_markets=max_mkts,
+            max_markets=max_mkts if not markets_parquet else None,
             max_days=max_days,
             include_closed=include_closed,
+            markets_parquet_path=markets_parquet,
         )
     else:
         # Show existing data
@@ -1310,5 +1670,8 @@ if __name__ == "__main__":
             print(f"  {key}: {len(files)} files")
         print(
             "\nTo fetch CLOB data: python -m src.trading.data_modules.fetcher "
-            "--clob [min_volume] [max_markets] [max_days] [include_closed]"
+            "--clob [min_volume] [max_markets] [max_days] [include_closed] [markets_parquet_path]"
+        )
+        print(
+            "  Example: python -m src.trading.data_modules.fetcher --clob 10000 None 1180 true data/polymarket/markets.parquet"
         )

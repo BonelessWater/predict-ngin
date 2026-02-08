@@ -61,7 +61,7 @@ def generate_momentum_signals_parquet(
     eval_freq_hours: int = 24,
     outcome: str = "YES",
     position_size: Optional[float] = None,
-    max_markets: Optional[int] = None,
+    max_markets: Optional[int] = 1000,
 ) -> pd.DataFrame:
     """
     Generate momentum signals from parquet price files using Polars.
@@ -198,7 +198,7 @@ def generate_momentum_signals_sqlite(
     eval_freq_hours: int = 24,
     outcome: str = "YES",
     position_size: Optional[float] = None,
-    max_markets: Optional[int] = None,
+    max_markets: Optional[int] = 1000,
 ) -> pd.DataFrame:
     """
     Generate momentum signals from SQLite polymarket_prices.
@@ -310,7 +310,7 @@ def generate_momentum_signals(
     eval_freq_hours: int = 24,
     outcome: str = "YES",
     position_size: Optional[float] = None,
-    max_markets: Optional[int] = None,
+    max_markets: Optional[int] = 1000,
     source: str = "auto",
 ) -> pd.DataFrame:
     """
@@ -325,7 +325,7 @@ def generate_momentum_signals(
         eval_freq_hours: Evaluation interval in hours (default 24 = daily).
         outcome: Outcome to trade (default YES).
         position_size: Optional size per signal for backtest.
-        max_markets: Optional cap on number of markets (for speed).
+        max_markets: Cap on number of markets (default: 1000).
         source: "auto" (parquet if available else sqlite), "parquet", or "sqlite".
 
     Returns:
