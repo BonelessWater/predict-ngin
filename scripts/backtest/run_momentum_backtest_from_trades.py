@@ -50,7 +50,7 @@ def main() -> int:
     parser.add_argument(
         "--trades-dir",
         default=None,
-        help="Parquet trades directory (default from config or data/parquet/trades)",
+        help="Parquet trades directory (default from config or data/polymarket/trades)",
     )
     parser.add_argument(
         "--start-date",
@@ -112,10 +112,27 @@ def main() -> int:
         default=10.0,
         help="Minimum USD trade size to include (default: 10.0)",
     )
+    parser.add_argument(
+        "--max-trades",
+        type=int,
+        default=None,
+        help="Maximum number of trades to load (for memory-constrained systems, default: None = all)",
+    )
+    parser.add_argument(
+        "--cache-size",
+        type=int,
+        default=50,
+        help="LRU cache size for price store (default: 50, lower = less memory)",
+    )
+    parser.add_argument(
+        "--columns-only",
+        action="store_true",
+        help="Load only essential columns (market_id, timestamp, price, outcome) to save memory",
+    )
     args = parser.parse_args()
 
     config = _load_config()
-    trades_dir = args.trades_dir or (config and config.database.parquet_dir + "/trades") or "data/parquet/trades"
+    trades_dir = args.trades_dir or (config and config.database.parquet_dir + "/trades") or "data/polymarket/trades"
     output_dir = args.output_dir or (config and config.backtest.output_dir) or "data/output"
     position_size = args.position_size
     if position_size is None and config:
@@ -132,6 +149,9 @@ def main() -> int:
     print("  position_size  ", position_size)
     print("  output_dir     ", output_dir)
     print("  min_usd        ", args.min_usd)
+    print("  max_trades     ", args.max_trades or "(all)")
+    print("  cache_size     ", args.cache_size)
+    print("  columns_only   ", args.columns_only)
 
     # Load trades
     print("\nLoading trades...")
@@ -142,10 +162,18 @@ def main() -> int:
         print("Make sure you have trades parquet files in the trades directory.")
         return 1
     
+    # Determine which columns to load
+    columns = None
+    if args.columns_only:
+        columns = ["market_id", "timestamp", "price", "outcome", "usd_amount", "token_amount", 
+                   "maker_direction", "taker_direction"]
+    
     trades_df = trade_store.load_trades(
         min_usd=args.min_usd,
         start_date=args.start_date,
         end_date=args.end_date,
+        limit=args.max_trades,
+        columns=columns,
     )
     
     if trades_df.empty:
@@ -182,7 +210,13 @@ def main() -> int:
 
     # Create price store from trades
     print("\nCreating price store from trades...")
-    price_store = TradeBasedPriceStore(trades_df)
+    price_store = TradeBasedPriceStore(trades_df, cache_size=args.cache_size)
+    
+    # Free memory: delete trades_df after creating price store
+    # The price store has its own copy, and we only need signals_df going forward
+    del trades_df
+    import gc
+    gc.collect()
 
     # Prepare config
     _bt = config.backtest if config else None

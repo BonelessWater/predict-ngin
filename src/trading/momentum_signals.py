@@ -20,7 +20,7 @@ except ImportError:
     pl = None
 
 # Default parquet layout
-DEFAULT_PARQUET_PRICES_DIR = "data/parquet/prices"
+DEFAULT_PARQUET_PRICES_DIR = "data/polymarket/prices"
 SECONDS_PER_DAY = 86400
 
 

@@ -122,6 +122,37 @@ def generate_momentum_signals_from_trades(
     if trades_df.empty:
         return pd.DataFrame(columns=["market_id", "signal_time", "signal_ts", "outcome", "side"])
     
+    # Filter to top markets by volume if max_markets is specified
+    if max_markets is not None and max_markets > 0:
+        # Calculate volume per market
+        if "usd_amount" in trades_df.columns:
+            market_volumes = trades_df.groupby("market_id")["usd_amount"].sum().sort_values(ascending=False)
+        elif "price" in trades_df.columns and "token_amount" in trades_df.columns:
+            # Calculate volume from price * token_amount
+            trades_df_copy = trades_df.copy()
+            trades_df_copy["volume"] = trades_df_copy["price"] * trades_df_copy["token_amount"]
+            market_volumes = trades_df_copy.groupby("market_id")["volume"].sum().sort_values(ascending=False)
+        else:
+            # Fallback: use trade count
+            market_volumes = trades_df.groupby("market_id").size().sort_values(ascending=False)
+        
+        # Get top N markets
+        top_markets = market_volumes.head(max_markets).index.tolist()
+        
+        original_count = len(trades_df)
+        original_markets = trades_df["market_id"].nunique()
+        
+        # Filter trades to only top markets
+        trades_df = trades_df[trades_df["market_id"].isin(top_markets)].copy()
+        
+        if trades_df.empty:
+            return pd.DataFrame(columns=["market_id", "signal_time", "signal_ts", "outcome", "side"])
+        
+        # Log filtering result
+        print(f"  Filtered to top {len(top_markets)} markets by volume")
+        print(f"    Trades: {original_count:,} -> {len(trades_df):,}")
+        print(f"    Markets: {original_markets:,} -> {trades_df['market_id'].nunique():,}")
+    
     # Convert trades to price history
     price_history = trades_to_price_history(trades_df, outcome=outcome)
     
@@ -129,6 +160,7 @@ def generate_momentum_signals_from_trades(
         return pd.DataFrame(columns=["market_id", "signal_time", "signal_ts", "outcome", "side"])
     
     # Use Polars if available for faster processing
+    # Note: max_markets already applied above, pass None to internal functions
     if pl is not None:
         return _generate_signals_polars(
             price_history,
@@ -136,7 +168,7 @@ def generate_momentum_signals_from_trades(
             eval_freq_hours,
             outcome,
             position_size,
-            max_markets,
+            None,  # Already filtered markets above
             start_date,
             end_date,
         )
@@ -147,7 +179,7 @@ def generate_momentum_signals_from_trades(
             eval_freq_hours,
             outcome,
             position_size,
-            max_markets,
+            None,  # Already filtered markets above
             start_date,
             end_date,
         )

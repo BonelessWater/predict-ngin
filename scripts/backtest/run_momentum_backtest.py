@@ -53,7 +53,7 @@ def main() -> int:
     parser.add_argument(
         "--parquet-dir",
         default=None,
-        help="Parquet prices directory (default from config or data/parquet/prices)",
+        help="Parquet prices directory (default from config or data/polymarket/prices)",
     )
     parser.add_argument(
         "--db-path",
@@ -123,7 +123,7 @@ def main() -> int:
     args = parser.parse_args()
 
     config = _load_config()
-    parquet_dir = args.parquet_dir or (config and config.database.parquet_dir + "/prices") or "data/parquet/prices"
+    parquet_dir = args.parquet_dir or (config and config.database.parquet_dir + "/prices") or "data/polymarket/prices"
     db_path = args.db_path or (config and config.database.path) or "data/prediction_markets.db"
     output_dir = args.output_dir or (config and config.backtest.output_dir) or "data/output"
     position_size = args.position_size

@@ -47,16 +47,27 @@ def analyze_markets_from_db(db_path: str = "data/prediction_markets.db") -> pd.D
         db.close()
 
 
-def analyze_markets_from_parquet(parquet_dir: str = "data/parquet/markets") -> pd.DataFrame:
-    """Load and categorize markets from parquet files."""
+def analyze_markets_from_parquet(parquet_dir: str = "data/polymarket") -> pd.DataFrame:
+    """Load and categorize markets from parquet files.
+    Supports: data/polymarket/markets.parquet (single) or data/parquet/markets/markets_*.parquet (sharded).
+    """
     markets_dir = Path(parquet_dir)
     if not markets_dir.exists():
-        return pd.DataFrame()
-    
-    files = sorted(markets_dir.glob("markets_*.parquet"))
+        # Fallback to legacy parquet location
+        markets_dir = Path("data/parquet/markets")
+        if not markets_dir.exists():
+            return pd.DataFrame()
+
+    files = []
+    single = markets_dir / "markets.parquet"
+    if single.exists():
+        files = [single]
+    else:
+        files = sorted(markets_dir.glob("markets_*.parquet"))
+
     if not files:
         return pd.DataFrame()
-    
+
     dfs = []
     for f in files:
         try:
@@ -64,10 +75,10 @@ def analyze_markets_from_parquet(parquet_dir: str = "data/parquet/markets") -> p
             dfs.append(df)
         except Exception:
             continue
-    
+
     if not dfs:
         return pd.DataFrame()
-    
+
     markets_df = pd.concat(dfs, ignore_index=True)
     
     # Extract question from various possible columns
@@ -100,7 +111,7 @@ def analyze_markets_from_parquet(parquet_dir: str = "data/parquet/markets") -> p
 
 def analyze_prices_by_category(
     markets_df: pd.DataFrame,
-    parquet_dir: str = "data/parquet/prices",
+    parquet_dir: str = "data/polymarket/prices",
     sample_limit: int = None,
 ) -> dict:
     """Count price data points per category."""
@@ -142,7 +153,7 @@ def analyze_prices_by_category(
 
 def analyze_trades_by_category(
     markets_df: pd.DataFrame,
-    parquet_dir: str = "data/parquet/trades",
+    parquet_dir: str = "data/polymarket/trades",
     sample_limit: int = None,
 ) -> dict:
     """Count trades per category."""
@@ -282,8 +293,8 @@ def main():
     
     parser = argparse.ArgumentParser(description="Analyze market categories and data volume")
     parser.add_argument("--db-path", default="data/prediction_markets.db", help="SQLite database path")
-    parser.add_argument("--parquet-prices", default="data/parquet/prices", help="Parquet prices directory")
-    parser.add_argument("--parquet-trades", default="data/parquet/trades", help="Parquet trades directory")
+    parser.add_argument("--parquet-prices", default="data/polymarket/prices", help="Parquet prices directory")
+    parser.add_argument("--parquet-trades", default="data/polymarket/trades", help="Parquet trades directory")
     parser.add_argument("--sample-markets", type=int, default=None, help="Limit market analysis (for speed)")
     parser.add_argument("--sample-trades", type=int, default=None, help="Limit trade analysis (for speed)")
     parser.add_argument("--skip-prices", action="store_true", help="Skip price analysis")
@@ -296,7 +307,7 @@ def main():
     
     if markets_df.empty:
         print("No markets found in database, trying parquet...")
-        markets_df = analyze_markets_from_parquet("data/parquet/markets")
+        markets_df = analyze_markets_from_parquet("data/polymarket")
     
     if markets_df.empty:
         print("No markets found in database or parquet.")

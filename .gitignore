@@ -22,9 +22,11 @@ __pycache__/
 .pytest_cache/
 
 # Data
+data/arb/
+data/polymarket/
+data/kalshi/
 data/output/
 data/parquet/
-data/polymarket/
 data/polymarket_clob/
 prediction_markets.db
 prediction_markets_sample.db

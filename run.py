@@ -243,6 +243,66 @@ def _run_polymarket_whales(args) -> None:
     print("=" * 70)
 
 
+def _write_arb_csv(pairs, price_store, output_path: Path) -> None:
+    """Write matched pairs with spread (edge) to CSV, sorted by edge descending."""
+    import pandas as pd
+
+    rows = []
+    for i, p in enumerate(pairs):
+        if (i + 1) % 100 == 0 or i == 0:
+            print(f"    Computing spreads {i+1}/{len(pairs)}...", flush=True)
+        spread_df = price_store.build_spread_series(p.polymarket_id, p.kalshi_ticker)
+        if spread_df.empty:
+            row = {
+                "edge": 0.0,
+                "abs_spread": 0.0,
+                "spread": 0.0,
+                "direction": "",
+                "poly_price": None,
+                "kalshi_price": None,
+                "timestamp": None,
+            }
+        else:
+            last = spread_df.iloc[-1]
+            spread = float(last["spread"])
+            abs_spread = float(last["abs_spread"])
+            direction = "buy_kalshi" if spread > 0 else "buy_poly"
+            row = {
+                "edge": abs_spread,
+                "abs_spread": abs_spread,
+                "spread": spread,
+                "direction": direction,
+                "poly_price": float(last["poly_price"]),
+                "kalshi_price": float(last["kalshi_price"]),
+                "timestamp": last.get("timestamp_unix"),
+            }
+        row.update({
+            "polymarket_id": p.polymarket_id,
+            "kalshi_ticker": p.kalshi_ticker,
+            "polymarket_question": p.polymarket_question[:300],
+            "kalshi_title": p.kalshi_title[:300],
+            "confidence": p.confidence,
+            "poly_volume": p.polymarket_volume,
+            "kalshi_volume": p.kalshi_volume,
+            "category": p.category,
+        })
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values("edge", ascending=False).reset_index(drop=True)
+    # Reorder: edge first, then identifiers, then details
+    col_order = [
+        "edge", "abs_spread", "spread", "direction",
+        "polymarket_id", "kalshi_ticker",
+        "polymarket_question", "kalshi_title",
+        "poly_price", "kalshi_price", "timestamp",
+        "confidence", "poly_volume", "kalshi_volume", "category",
+    ]
+    df = df[[c for c in col_order if c in df.columns]]
+    df.to_csv(output_path, index=False)
+    print(f"  Wrote {len(df):,} pairs to {output_path} (sorted by edge descending)")
+
+
 def main():
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument(
@@ -577,8 +637,8 @@ Examples:
     parser.add_argument(
         "--clob-min-volume",
         type=float,
-        default=10000,
-        help="Minimum 24hr volume for CLOB markets (default: 10000)",
+        default=100000,
+        help="Minimum 24hr volume for CLOB markets (default: 100000)",
     )
     parser.add_argument(
         "--clob-max-markets",
@@ -591,6 +651,99 @@ Examples:
         type=str,
         default=None,
         help="Path to markets.parquet file to use instead of fetching from API (default: None)",
+    )
+    parser.add_argument(
+        "--fetch-kalshi",
+        action="store_true",
+        help="Fetch Kalshi events, markets, trades, and price data",
+    )
+    parser.add_argument(
+        "--kalshi-min-volume",
+        type=float,
+        default=100000,
+        help="Minimum volume (contracts) for Kalshi markets (default: 100000)",
+    )
+    parser.add_argument(
+        "--kalshi-no-trades",
+        action="store_true",
+        help="Skip fetching Kalshi trades (only events, markets, prices)",
+    )
+    parser.add_argument(
+        "--kalshi-no-prices",
+        action="store_true",
+        help="Skip fetching Kalshi candlestick price data",
+    )
+    parser.add_argument(
+        "--kalshi-workers",
+        type=int,
+        default=20,
+        help="Number of parallel workers for Kalshi fetch (default: 20)",
+    )
+    parser.add_argument(
+        "--kalshi-max-pages",
+        type=int,
+        default=0,
+        help="Max event pages to scan (0=all, ~15 covers popular markets, default: 0)",
+    )
+    parser.add_argument(
+        "--kalshi-flush-interval",
+        type=int,
+        default=10,
+        help="Flush Kalshi data to disk every N markets (default: 10, reduce for low memory)",
+    )
+    parser.add_argument(
+        "--clob-flush-interval",
+        type=int,
+        default=10,
+        help="Flush Polymarket CLOB data to disk every N markets (default: 10, reduce for low memory)",
+    )
+    parser.add_argument(
+        "--clob-max-memory-rows",
+        type=int,
+        default=100000,
+        help="Max rows to accumulate before flush for Polymarket (default: 100000)",
+    )
+    # Cross-platform arbitrage
+    parser.add_argument(
+        "--arbitrage",
+        action="store_true",
+        help="Run cross-platform arbitrage backtest (Polymarket vs Kalshi)",
+    )
+    parser.add_argument(
+        "--arb-entry-spread",
+        type=float,
+        default=0.05,
+        help="Minimum spread to enter arb position (default: 0.05)",
+    )
+    parser.add_argument(
+        "--arb-exit-spread",
+        type=float,
+        default=0.01,
+        help="Close arb when spread narrows to this (default: 0.01)",
+    )
+    parser.add_argument(
+        "--arb-show-matches",
+        action="store_true",
+        help="Show matched markets and exit (no backtest)",
+    )
+    parser.add_argument(
+        "--arb-max-kalshi",
+        type=int,
+        default=50_000,
+        help="Max Kalshi markets to use for matching (default: 50000, avoids OOM)",
+    )
+    parser.add_argument(
+        "--arb-max-poly",
+        type=int,
+        default=None,
+        help="Max Polymarket markets for matching (default: all). Use e.g. 20000 for faster runs.",
+    )
+    parser.add_argument(
+        "--arb-output-csv",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Write matched pairs with spread (edge) to CSV, sorted by edge descending",
     )
     parser.add_argument(
         "--build-db",
@@ -692,10 +845,40 @@ Examples:
         db.close()
         return
 
+    # Handle Kalshi-only fetch early (light imports, no need for full trading package)
+    if args.fetch_kalshi and not args.fetch and not args.fetch_only and not args.fetch_clob:
+        print("\n[0] Fetching Kalshi data from API...")
+        from trading.data_modules.fetcher import DataFetcher as _KalshiFetcher
+        fetcher = _KalshiFetcher(str(Path(args.data_dir).parent))
+        fetcher.fetch_kalshi_data(
+            min_volume=args.kalshi_min_volume,
+            fetch_trades=not args.kalshi_no_trades,
+            fetch_prices=not args.kalshi_no_prices,
+            workers=args.kalshi_workers,
+            max_event_pages=args.kalshi_max_pages,
+            flush_interval=args.kalshi_flush_interval,
+        )
+        print("\nKalshi fetch complete.")
+        return
+
     # Handle fetch options
-    if args.fetch or args.fetch_only or args.fetch_clob:
+    if args.fetch or args.fetch_only or args.fetch_clob or args.fetch_kalshi:
         print("\n[0] Fetching data from APIs...")
         fetcher = DataFetcher(str(Path(args.data_dir).parent))
+
+        if args.fetch_kalshi:
+            # Fetch Kalshi data via events endpoint (fast discovery)
+            fetcher.fetch_kalshi_data(
+                min_volume=args.kalshi_min_volume,
+                fetch_trades=not args.kalshi_no_trades,
+                fetch_prices=not args.kalshi_no_prices,
+                workers=args.kalshi_workers,
+                max_event_pages=args.kalshi_max_pages,
+                flush_interval=args.kalshi_flush_interval,
+            )
+            if not args.fetch and not args.fetch_only and not args.fetch_clob:
+                print("\nKalshi fetch complete.")
+                return
 
         if args.fetch_clob:
             # Only fetch CLOB data
@@ -703,16 +886,117 @@ Examples:
                 min_volume=args.clob_min_volume,
                 max_markets=args.clob_max_markets if not args.clob_markets_parquet else None,
                 markets_parquet_path=args.clob_markets_parquet,
+                flush_interval=args.clob_flush_interval,
+                max_memory_rows=args.clob_max_memory_rows,
             )
             if not args.fetch and not args.fetch_only:
                 print("\nCLOB fetch complete.")
                 return
-        else:
+        elif not args.fetch_kalshi:
             fetcher.fetch_all()
 
         if args.fetch_only:
             print("\nFetch complete. Use 'python run.py' to run backtest.")
             return
+
+    # Handle cross-platform arbitrage
+    if args.arbitrage:
+        print("\n[ARB] Cross-Platform Arbitrage Backtest")
+        print("      Polymarket vs Kalshi")
+
+        from src.trading.arbitrage import (
+            MarketMatcher,
+            CrossPlatformPriceStore,
+            ArbitrageStrategy,
+            ArbitrageBacktestConfig,
+            run_arbitrage_backtest,
+            print_arbitrage_result,
+        )
+        from src.trading.arbitrage.arbitrage_strategy import PlatformFees
+
+        data_root = Path(args.data_dir).parent
+
+        # Load markets
+        poly_path = data_root / "polymarket" / "markets.parquet"
+        kalshi_path = data_root / "kalshi" / "markets.parquet"
+
+        if not poly_path.exists() or not kalshi_path.exists():
+            missing = []
+            if not poly_path.exists():
+                missing.append("Polymarket (run --fetch-clob)")
+            if not kalshi_path.exists():
+                missing.append("Kalshi (run --fetch-kalshi)")
+            print(f"  Missing data: {', '.join(missing)}")
+            return
+
+        import pandas as pd
+        poly_markets = pd.read_parquet(poly_path)
+        kalshi_markets = pd.read_parquet(kalshi_path)
+        print(f"  Polymarket: {len(poly_markets):,} markets")
+        print(f"  Kalshi:     {len(kalshi_markets):,} markets")
+
+        if args.arb_max_poly and len(poly_markets) > args.arb_max_poly:
+            vol_col = "volume" if "volume" in poly_markets.columns else "volume24hr"
+            if vol_col in poly_markets.columns:
+                vol = pd.to_numeric(poly_markets[vol_col], errors="coerce").fillna(0)
+                poly_markets = poly_markets.loc[vol.nlargest(args.arb_max_poly).index].reset_index(drop=True)
+            else:
+                poly_markets = poly_markets.head(args.arb_max_poly)
+            print(f"  Polymarket (top {args.arb_max_poly:,} by volume): {len(poly_markets):,} markets")
+
+        # Limit Kalshi to high-volume markets (TF-IDF on 17M+ markets needs ~5TB RAM)
+        arb_max_kalshi = args.arb_max_kalshi
+        if len(kalshi_markets) > arb_max_kalshi:
+            vol_col = "volume" if "volume" in kalshi_markets.columns else "volume_24h"
+            if vol_col in kalshi_markets.columns:
+                vol = pd.to_numeric(kalshi_markets[vol_col], errors="coerce").fillna(0)
+                kalshi_markets = kalshi_markets.loc[vol.nlargest(arb_max_kalshi).index].reset_index(drop=True)
+            else:
+                kalshi_markets = kalshi_markets.head(arb_max_kalshi)
+            print(f"  Kalshi (top {arb_max_kalshi:,} by volume): {len(kalshi_markets):,} markets")
+
+        matcher = MarketMatcher()
+        pairs = matcher.match(poly_markets, kalshi_markets)
+        print(f"  Matched pairs: {len(pairs)}")
+
+        if not pairs:
+            print("  No matched pairs found.")
+            return
+
+        price_store = CrossPlatformPriceStore(
+            polymarket_prices_dir=str(data_root / "polymarket" / "prices"),
+            kalshi_prices_dir=str(data_root / "kalshi" / "prices"),
+        )
+
+        if args.arb_output_csv:
+            _write_arb_csv(pairs, price_store, Path(args.arb_output_csv))
+
+        if args.arb_show_matches:
+            for p in pairs[:20]:
+                print(f"    [{p.confidence:.3f}] {p.polymarket_question[:45]} = {p.kalshi_title[:45]}")
+            return
+
+        strategy = ArbitrageStrategy(
+            entry_spread=args.arb_entry_spread,
+            exit_spread=args.arb_exit_spread,
+        )
+        signals = strategy.generate_signals(pairs, price_store)
+        print(f"  Signals: {len(signals)}")
+
+        if signals:
+            result = run_arbitrage_backtest(
+                signals=signals,
+                price_store=price_store,
+                config=ArbitrageBacktestConfig(
+                    position_size=float(getattr(args, "position_size", 100)),
+                    starting_capital=float(getattr(args, "starting_capital", 10000)),
+                ),
+            )
+            result.pairs_analyzed = len(pairs)
+            print_arbitrage_result(result)
+        else:
+            print("  No arbitrage opportunities found.")
+        return
 
     # Handle liquidity capture
     if args.capture_liquidity:

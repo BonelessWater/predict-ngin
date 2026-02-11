@@ -105,7 +105,7 @@ class TradeCollector(BaseCollector[Trade]):
 
     def fetch_order_filled_events(
         self,
-        output_dir: str = "data/parquet/order_filled_events",
+        output_dir: str = "data/polymarket/order_filled_events",
         batch_size: int = 1000,
         start_ts: Optional[int] = None,
         end_ts: Optional[int] = None,
@@ -139,9 +139,9 @@ class TradeCollector(BaseCollector[Trade]):
 
     def process_trades(
         self,
-        order_filled_dir: str = "data/parquet/order_filled_events",
-        output_dir: str = "data/parquet/trades",
-        markets_dir: str = "data/parquet/markets",
+        order_filled_dir: str = "data/polymarket/order_filled_events",
+        output_dir: str = "data/polymarket/trades",
+        markets_dir: str = "data/polymarket",
         reset: bool = False,
         max_files: int = 0,
         fetch_missing_tokens: bool = False,

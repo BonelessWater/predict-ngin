@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 DEFAULT_DB_PATH = "data/prediction_markets.db"
-DEFAULT_PARQUET_DIR = "data/parquet/trades"
+DEFAULT_PARQUET_DIR = "data/polymarket/trades"
 
 
 def load_whale_trades(

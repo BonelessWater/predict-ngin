@@ -30,7 +30,7 @@ from trading.data_modules.parquet_store import PriceStore
 
 
 def load_prices_polars(
-    parquet_dir: str = "data/parquet/prices",
+    parquet_dir: str = "data/polymarket/prices",
     market_ids: Optional[List[str]] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -123,7 +123,7 @@ def load_prices_polars(
 def load_prices_by_category(
     markets_df: pd.DataFrame,
     category: str,
-    parquet_dir: str = "data/parquet/prices",
+    parquet_dir: str = "data/polymarket/prices",
     max_markets: int = 100,
     use_polars: bool = True,
 ) -> pd.DataFrame:
@@ -161,7 +161,7 @@ def load_prices_by_category(
 def load_prices_date_range(
     start_date: str,
     end_date: str,
-    parquet_dir: str = "data/parquet/prices",
+    parquet_dir: str = "data/polymarket/prices",
     market_ids: Optional[List[str]] = None,
     outcome: str = "YES",
     use_polars: bool = True,
@@ -233,7 +233,7 @@ def fetch_prices_from_api(
 
 def convert_json_to_parquet(
     json_dir: str = "data/polymarket_clob",
-    output_dir: str = "data/parquet/prices",
+    output_dir: str = "data/polymarket/prices",
 ) -> None:
     """
     Convert fetched JSON price files to monthly parquet partitions.

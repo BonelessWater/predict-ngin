@@ -22,7 +22,7 @@ def _require_polars() -> bool:
     }
 
 DEFAULT_DB_PATH = "data/prediction_markets.db"
-DEFAULT_PARQUET_DIR = "data/parquet/trades"
+DEFAULT_PARQUET_DIR = "data/polymarket/trades"
 
 POLY_WHALE_METHODS = {
     "volume_top10": "Top 10 by total volume",

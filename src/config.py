@@ -100,7 +100,7 @@ class ConfigNamespace:
 class DatabaseSettings:
     path: str = "data/prediction_markets.db"
     polymarket_trades_path: str = "data/poly_data/processed/trades.csv"
-    parquet_dir: str = "data/parquet"
+    parquet_dir: str = "data/polymarket"
     backup_enabled: bool = True
     backup_interval_hours: int = 24
 
@@ -276,7 +276,7 @@ class LiquiditySettings:
     capture_interval_minutes: int = 5
     min_volume: float = 1000
     max_markets: int = 500
-    store_dir: str = "data/parquet/liquidity"
+    store_dir: str = "data/polymarket/liquidity"
 
 
 @dataclass

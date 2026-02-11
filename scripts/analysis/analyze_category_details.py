@@ -34,13 +34,18 @@ sns.set_style("whitegrid")
 plt.rcParams["figure.figsize"] = (12, 6)
 
 
-def load_markets(parquet_dir: str = "data/parquet/markets") -> pd.DataFrame:
-    """Load markets from parquet files."""
+def load_markets(parquet_dir: str = "data/polymarket") -> pd.DataFrame:
+    """Load markets from parquet files.
+    Supports: markets.parquet (single) or markets_*.parquet (sharded).
+    """
     markets_dir = Path(parquet_dir)
     if not markets_dir.exists():
-        return pd.DataFrame()
-    
-    files = sorted(markets_dir.glob("markets_*.parquet"))
+        markets_dir = Path("data/parquet/markets")
+        if not markets_dir.exists():
+            return pd.DataFrame()
+
+    single = markets_dir / "markets.parquet"
+    files = [single] if single.exists() else sorted(markets_dir.glob("markets_*.parquet"))
     if not files:
         return pd.DataFrame()
     
@@ -467,8 +472,8 @@ def main():
     print(f"Categories: {', '.join(categories)}")
     
     # Initialize stores
-    price_store = PriceStore("data/parquet/prices")
-    trade_store = TradeStore("data/parquet/trades")
+    price_store = PriceStore("data/polymarket/prices")
+    trade_store = TradeStore("data/polymarket/trades")
     
     # Analyze returns
     print("\nAnalyzing returns...")

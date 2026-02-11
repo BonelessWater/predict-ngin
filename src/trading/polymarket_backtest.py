@@ -54,7 +54,7 @@ class ClobPriceStore:
         db: Optional[PredictionMarketDB] = None,
         db_path: str = "data/prediction_markets.db",
         use_parquet: Optional[bool] = None,
-        parquet_dir: str = "data/parquet/prices",
+        parquet_dir: str = "data/polymarket/prices",
     ):
         self._own_db = db is None
         self.db = db or PredictionMarketDB(db_path)

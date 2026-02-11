@@ -53,6 +53,21 @@ class TradeBasedPriceStore(PriceStore):
         # Don't call super().__init__() - we don't use file-based storage
         self.base_dir = None
         
+        # Store only market volume summary for metadata (much smaller than full trades)
+        # Calculate volume per market upfront to avoid storing full trades
+        if not trades_df.empty:
+            if "usd_amount" in trades_df.columns:
+                self._market_volumes = trades_df.groupby("market_id")["usd_amount"].sum().to_dict()
+            elif "price" in trades_df.columns and "token_amount" in trades_df.columns:
+                volume_df = trades_df.copy()
+                volume_df["volume"] = volume_df["price"] * volume_df["token_amount"]
+                self._market_volumes = volume_df.groupby("market_id")["volume"].sum().to_dict()
+            else:
+                # Fallback: trade count
+                self._market_volumes = trades_df.groupby("market_id").size().to_dict()
+        else:
+            self._market_volumes = {}
+        
         if trades_df.empty:
             self._price_df = pd.DataFrame(
                 columns=["market_id", "outcome", "timestamp", "price", "timestamp_unix"]
@@ -74,6 +89,19 @@ class TradeBasedPriceStore(PriceStore):
                     raise ValueError(
                         "Trades must have 'price' column or both 'usd_amount' and 'token_amount'"
                     )
+            
+            # Add outcome column if missing (infer from maker_direction or taker_direction)
+            if "outcome" not in trades_df.columns:
+                if "maker_direction" in trades_df.columns:
+                    trades_df["outcome"] = trades_df["maker_direction"].str.upper()
+                    # Normalize: if it's buy/sell or other values, default to YES
+                    trades_df.loc[~trades_df["outcome"].isin(["YES", "NO"]), "outcome"] = "YES"
+                elif "taker_direction" in trades_df.columns:
+                    trades_df["outcome"] = trades_df["taker_direction"].str.upper()
+                    trades_df.loc[~trades_df["outcome"].isin(["YES", "NO"]), "outcome"] = "YES"
+                else:
+                    # No direction info, default to YES
+                    trades_df["outcome"] = "YES"
             
             # Create price history from trades
             self._price_df = (
@@ -131,6 +159,66 @@ class TradeBasedPriceStore(PriceStore):
         # LRU cache
         self._cache: OrderedDict = OrderedDict()
         self._cache_size = cache_size
+        self._metadata_cache: Dict[str, Dict[str, Any]] = {}
+    
+    def get_market_metadata(self, market_id: str) -> Dict[str, Any]:
+        """
+        Get market metadata from trades.
+        
+        Since we only have trades, we can calculate volume but not liquidity or end_date.
+        Returns minimal metadata compatible with backtest expectations.
+        
+        Args:
+            market_id: Market identifier
+            
+        Returns:
+            Dict with liquidity, volume, volume_24hr, end_date, etc.
+        """
+        # #region agent log
+        import json
+        with open(r'c:\Users\domdd\Documents\GitHub\predict-ngin\.cursor\debug.log', 'a') as f:
+            f.write(json.dumps({"id":"log_get_metadata_entry","timestamp":int(__import__('time').time()*1000),"location":"trade_price_store.py:get_market_metadata","message":"Getting market metadata","data":{"market_id":market_id},"runId":"debug","hypothesisId":"A"})+'\n')
+        # #endregion
+        
+        # Check cache
+        if market_id in self._metadata_cache:
+            # #region agent log
+            with open(r'c:\Users\domdd\Documents\GitHub\predict-ngin\.cursor\debug.log', 'a') as f:
+                f.write(json.dumps({"id":"log_get_metadata_cached","timestamp":int(__import__('time').time()*1000),"location":"trade_price_store.py:get_market_metadata","message":"Returning cached metadata","data":{"market_id":market_id},"runId":"debug","hypothesisId":"A"})+'\n')
+            # #endregion
+            return self._metadata_cache[market_id]
+        
+        # Get volume from pre-calculated market volumes (much faster and memory-efficient)
+        volume = float(self._market_volumes.get(str(market_id), 0.0))
+        
+        # #region agent log
+        with open(r'c:\Users\domdd\Documents\GitHub\predict-ngin\.cursor\debug.log', 'a') as f:
+            f.write(json.dumps({"id":"log_get_metadata_calc","timestamp":int(__import__('time').time()*1000),"location":"trade_price_store.py:get_market_metadata","message":"Got volume from pre-calculated dict","data":{"market_id":market_id,"volume":volume},"runId":"debug","hypothesisId":"A"})+'\n')
+        # #endregion
+        
+        # Return minimal metadata compatible with backtest
+        meta = {
+            "id": str(market_id),
+            "liquidity": 0.0,  # Not available from trades
+            "volume": volume,
+            "volume_24hr": volume,  # Use total volume as proxy
+            "end_date": None,  # Not available from trades
+            "endDate": None,
+            "closed_time": None,
+            "resolution_outcome": None,
+            "resolution_price_yes": None,
+            "resolution_price_no": None,
+        }
+        
+        # Cache it
+        self._metadata_cache[market_id] = meta
+        
+        # #region agent log
+        with open(r'c:\Users\domdd\Documents\GitHub\predict-ngin\.cursor\debug.log', 'a') as f:
+            f.write(json.dumps({"id":"log_get_metadata_return","timestamp":int(__import__('time').time()*1000),"location":"trade_price_store.py:get_market_metadata","message":"Returning metadata","data":{"market_id":market_id,"meta_keys":list(meta.keys())},"runId":"debug","hypothesisId":"A"})+'\n')
+        # #endregion
+        
+        return meta
     
     def available(self) -> bool:
         """Always available if trades were provided."""

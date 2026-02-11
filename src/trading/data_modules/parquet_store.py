@@ -31,7 +31,11 @@ def _require_polars() -> bool:
     }
 
 
-DEFAULT_PARQUET_DIR = "data/parquet"
+DEFAULT_PARQUET_DIR = "data/polymarket"
+
+
+_PARQUET_TRADES_FALLBACK = "data/parquet/trades"
+_PARQUET_PRICES_FALLBACK = "data/parquet/prices"
 
 
 class TradeStore:
@@ -40,13 +44,24 @@ class TradeStore:
     def __init__(self, base_dir: Optional[str] = None):
         self.base_dir = Path(base_dir or f"{DEFAULT_PARQUET_DIR}/trades")
 
+    def _effective_dir(self) -> Path:
+        """Use polymarket/trades; fallback to parquet/trades if empty."""
+        if self.base_dir.exists() and any(self.base_dir.glob("trades_*.parquet")):
+            return self.base_dir
+        fallback = Path(_PARQUET_TRADES_FALLBACK)
+        if fallback.exists() and any(fallback.glob("trades_*.parquet")):
+            return fallback
+        return self.base_dir
+
     def available(self) -> bool:
         """Check if parquet trade files exist."""
-        return self.base_dir.exists() and any(self.base_dir.glob("trades_*.parquet"))
+        return self._effective_dir().exists() and any(
+            self._effective_dir().glob("trades_*.parquet")
+        )
 
     def list_months(self) -> List[str]:
         """List available months (YYYY-MM)."""
-        files = sorted(self.base_dir.glob("trades_*.parquet"))
+        files = sorted(self._effective_dir().glob("trades_*.parquet"))
         return [f.stem.replace("trades_", "") for f in files]
 
     def _select_files(
@@ -55,7 +70,7 @@ class TradeStore:
         end_date: Optional[str] = None,
     ) -> List[Path]:
         """Select parquet files based on date range."""
-        files = sorted(self.base_dir.glob("trades_*.parquet"))
+        files = sorted(self._effective_dir().glob("trades_*.parquet"))
         if not files:
             return []
 
@@ -241,9 +256,20 @@ class PriceStore:
         self._cache: OrderedDict = OrderedDict()
         self._cache_size = cache_size
 
+    def _effective_dir(self) -> Path:
+        """Use polymarket/prices; fallback to parquet/prices if empty."""
+        if self.base_dir.exists() and any(self.base_dir.glob("prices_*.parquet")):
+            return self.base_dir
+        fallback = Path(_PARQUET_PRICES_FALLBACK)
+        if fallback.exists() and any(fallback.glob("prices_*.parquet")):
+            return fallback
+        return self.base_dir
+
     def available(self) -> bool:
         """Check if parquet price files exist."""
-        return self.base_dir.exists() and any(self.base_dir.glob("prices_*.parquet"))
+        return self._effective_dir().exists() and any(
+            self._effective_dir().glob("prices_*.parquet")
+        )
 
     def get_price_history(
         self,
@@ -275,7 +301,7 @@ class PriceStore:
         # Use Polars lazy scanning if available (much faster for large datasets)
         if pl is not None:
             try:
-                files = sorted(self.base_dir.glob("prices_*.parquet"))
+                files = sorted(self._effective_dir().glob("prices_*.parquet"))
                 if not files:
                     result = pd.DataFrame(
                         columns=["market_id", "outcome", "timestamp", "price"]
@@ -327,7 +353,7 @@ class PriceStore:
     ) -> pd.DataFrame:
         """Fallback pandas implementation for get_price_history."""
         dfs = []
-        for f in sorted(self.base_dir.glob("prices_*.parquet")):
+        for f in sorted(self._effective_dir().glob("prices_*.parquet")):
             try:
                 df = pd.read_parquet(
                     f,
@@ -385,7 +411,7 @@ class PriceStore:
         # Use Polars lazy scanning if available
         if pl is not None:
             try:
-                files = sorted(self.base_dir.glob("prices_*.parquet"))
+                files = sorted(self._effective_dir().glob("prices_*.parquet"))
                 if not files:
                     return pd.DataFrame()
                 
@@ -415,7 +441,7 @@ class PriceStore:
         
         # Fallback to pandas implementation
         dfs = []
-        for f in sorted(self.base_dir.glob("prices_*.parquet")):
+        for f in sorted(self._effective_dir().glob("prices_*.parquet")):
             try:
                 df = pd.read_parquet(
                     f,

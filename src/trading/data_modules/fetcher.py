@@ -29,6 +29,7 @@ POLYMARKET_ORDERBOOK_API = (
     "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/"
     "subgraphs/orderbook-subgraph/0.0.1/gn"
 )
+KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 
 # CLOB API limits - max ~7 days per request
 CLOB_MAX_RANGE_SECONDS = 7 * 24 * 60 * 60
@@ -284,7 +285,7 @@ class DataFetcher:
             limit: Maximum markets to fetch
             batch_size: Markets per request (max 100)
             output_format: "json" or "parquet"
-            parquet_dir: Output dir for parquet (default: data/parquet/markets)
+            parquet_dir: Output dir for parquet (default: data/polymarket)
 
         Returns:
             Total markets fetched
@@ -301,7 +302,7 @@ class DataFetcher:
             import pyarrow as pa
             import pyarrow.parquet as pq
 
-            parquet_output_dir = Path(parquet_dir) if parquet_dir else Path("data/parquet/markets")
+            parquet_output_dir = Path(parquet_dir) if parquet_dir else Path("data/polymarket")
             parquet_output_dir.mkdir(parents=True, exist_ok=True)
 
             def _save_parquet_batch(rows: List[Dict[str, Any]], file_num: int) -> None:
@@ -849,8 +850,8 @@ class DataFetcher:
         workers: int = MAX_WORKERS,
         include_closed: bool = True,  # Default: include closed markets for maximum historical data
         markets_parquet_path: Optional[str] = None,  # Path to markets.parquet file
-        flush_interval: int = 50,  # Flush every N markets
-        max_memory_rows: int = 1_000_000,  # Flush when accumulator exceeds this many rows
+        flush_interval: int = 10,  # Flush every N markets (reduce for low memory)
+        max_memory_rows: int = 100_000,  # Flush when accumulator exceeds this many rows
     ) -> int:
         """
         Fetch historical price data for Polymarket markets with memory management and resumability.
@@ -876,16 +877,16 @@ class DataFetcher:
         """
         self._require_pyarrow()
         
-        # Output to parquet directory instead of JSON
-        parquet_dir = self.data_dir / "parquet" / "prices"
+        # Store price data in data/polymarket/prices/ to keep all Polymarket data together
+        polymarket_dir = self.data_dir / "polymarket"
+        parquet_dir = polymarket_dir / "prices"
         parquet_dir.mkdir(parents=True, exist_ok=True)
         
-        # Keep market metadata in JSON for now (small, easy to query)
-        metadata_dir = self.data_dir / "polymarket_clob"
-        metadata_dir.mkdir(parents=True, exist_ok=True)
-
-        # Checkpoint file for resumability
-        checkpoint_path = metadata_dir / "price_fetch_checkpoint.json"
+        # Checkpoint file for resumability (also in polymarket directory)
+        checkpoint_path = polymarket_dir / "price_fetch_checkpoint.json"
+        
+        # Keep market metadata index in polymarket directory
+        metadata_dir = polymarket_dir
 
         # Load checkpoint to resume if interrupted
         processed_market_ids = self._load_checkpoint(checkpoint_path)
@@ -1122,7 +1123,7 @@ class DataFetcher:
         # Save final checkpoint
         self._save_checkpoint(checkpoint_path, processed_market_ids)
         
-        # Save market index (metadata)
+        # Save market index (metadata) in polymarket directory
         all_markets = markets + [{"id": mid} for mid in processed_market_ids if mid not in {str(m["id"]) for m in markets}]
         index = [{
             "id": m.get("id", m),
@@ -1130,7 +1131,7 @@ class DataFetcher:
             "question": m.get("question", "")[:100],
             "volume24hr": m.get("volume24hr", 0),
         } for m in all_markets if isinstance(m, dict)]
-        self._save_json(index, metadata_dir / "market_index.json")
+        self._save_json(index, polymarket_dir / "market_index.json")
 
         print(f"\n  Complete: {progress['fetched']} markets, {progress['total_points']:,} data points")
         print(f"  Written: {total_flushed:,} total rows to parquet files")
@@ -1141,7 +1142,7 @@ class DataFetcher:
 
     def fetch_polymarket_order_filled_events(
         self,
-        output_dir: str = "data/parquet/order_filled_events",
+        output_dir: str = "data/polymarket/order_filled_events",
         state_path: Optional[str] = None,
         endpoint: str = POLYMARKET_ORDERBOOK_API,
         entity: str = "orderFilledEvents",
@@ -1349,9 +1350,9 @@ class DataFetcher:
 
     def process_polymarket_trades_from_order_filled(
         self,
-        order_filled_dir: str = "data/parquet/order_filled_events",
-        output_dir: str = "data/parquet/trades",
-        markets_dir: str = "data/parquet/markets",
+        order_filled_dir: str = "data/polymarket/order_filled_events",
+        output_dir: str = "data/polymarket/trades",
+        markets_dir: str = "data/polymarket",
         state_path: Optional[str] = None,
         reset: bool = False,
         max_files: int = 0,
@@ -1532,6 +1533,882 @@ class DataFetcher:
         }
 
     # =========================================================================
+    # KALSHI
+    # =========================================================================
+
+    def fetch_kalshi_events(
+        self,
+        with_nested_markets: bool = True,
+        status: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Fetch events from Kalshi API (paginated, no auth required)."""
+        all_events: List[Dict[str, Any]] = []
+        cursor = ""
+        page = 0
+
+        while True:
+            params: Dict[str, Any] = {
+                "limit": min(limit, 200),
+                "with_nested_markets": str(with_nested_markets).lower(),
+            }
+            if cursor:
+                params["cursor"] = cursor
+            if status:
+                params["status"] = status
+
+            try:
+                response = self.session.get(
+                    f"{KALSHI_API}/events", params=params, timeout=60,
+                )
+                if response.status_code == 429:
+                    time.sleep(2)
+                    continue
+                response.raise_for_status()
+                data = response.json()
+            except requests.RequestException as e:
+                print(f"  Error fetching Kalshi events (page {page}): {e}")
+                break
+
+            events = data.get("events", [])
+            if not events:
+                break
+
+            all_events.extend(events)
+            page += 1
+            if page % 5 == 0:
+                print(f"  Fetched {len(all_events):,} events (page {page})...")
+
+            cursor = data.get("cursor", "")
+            if not cursor:
+                break
+            self._rate_limit()
+
+        return all_events
+
+    def fetch_kalshi_markets(
+        self,
+        status: Optional[str] = None,
+        event_ticker: Optional[str] = None,
+        limit: int = 1000,
+        min_volume: float = 0,
+    ) -> List[Dict[str, Any]]:
+        """Fetch markets from Kalshi API (paginated, no auth required).
+
+        If min_volume > 0, only markets meeting the threshold are kept in memory.
+        All markets are still scanned, but low-volume ones are discarded immediately.
+        Uses a fresh session to avoid memory accumulation in long scans.
+
+        NOTE: The /markets endpoint returns 100k+ mostly low-volume sports parlays.
+        For better results, use fetch_kalshi_markets_via_events() which finds
+        high-volume markets much faster by scanning events first.
+        """
+        import gc
+
+        all_markets: List[Dict[str, Any]] = []
+        cursor = ""
+        page = 0
+        total_scanned = 0
+
+        # Use a dedicated session for this long scan to avoid memory leaks
+        scan_session = requests.Session()
+        scan_session.headers.update({"User-Agent": "PredictionMarketResearch/1.0"})
+
+        try:
+            while True:
+                params: Dict[str, Any] = {"limit": min(limit, 1000)}
+                if cursor:
+                    params["cursor"] = cursor
+                if status:
+                    params["status"] = status
+                if event_ticker:
+                    params["event_ticker"] = event_ticker
+
+                try:
+                    response = scan_session.get(
+                        f"{KALSHI_API}/markets", params=params, timeout=60,
+                    )
+                    if response.status_code == 429:
+                        response.close()
+                        time.sleep(2)
+                        continue
+                    response.raise_for_status()
+                    data = response.json()
+                    response.close()
+                except requests.RequestException as e:
+                    print(f"  Error fetching Kalshi markets (page {page}): {e}")
+                    break
+                except MemoryError:
+                    print(f"  MemoryError at page {page}, scanned {total_scanned:,}.")
+                    gc.collect()
+                    scan_session.close()
+                    scan_session = requests.Session()
+                    scan_session.headers.update({"User-Agent": "PredictionMarketResearch/1.0"})
+                    time.sleep(1)
+                    continue
+
+                markets = data.get("markets", [])
+                cursor = data.get("cursor", "")
+                del data
+
+                if not markets:
+                    break
+
+                if min_volume > 0:
+                    for m in markets:
+                        vol = m.get("volume", 0) or 0
+                        if vol >= min_volume:
+                            all_markets.append(m)
+                else:
+                    all_markets.extend(markets)
+
+                total_scanned += len(markets)
+                del markets
+                page += 1
+
+                # Print progress every 5 pages (not 20) for better visibility
+                if page % 5 == 0:
+                    if min_volume > 0:
+                        print(f"  Scanned {total_scanned:,} markets (page {page}), "
+                              f"kept {len(all_markets):,} with volume >= {min_volume:,.0f}")
+                    else:
+                        print(f"  Fetched {total_scanned:,} markets (page {page})...")
+                    gc.collect()
+
+                if not cursor:
+                    break
+                self._rate_limit()
+        finally:
+            scan_session.close()
+
+        if min_volume > 0:
+            print(f"  Scan complete: {total_scanned:,} scanned, {len(all_markets):,} kept")
+        return all_markets
+
+    def fetch_kalshi_markets_via_events(
+        self,
+        min_volume: float = 0,
+        max_pages: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Fetch Kalshi markets via the events endpoint (much faster).
+
+        The /events endpoint with nested markets returns high-volume political,
+        economic, and other popular markets immediately, avoiding the need to
+        scan through 100k+ low-volume sports parlays via /markets.
+
+        Typically ~15 pages (~3000 events) covers all popular markets.
+
+        Args:
+            min_volume: Minimum total volume (contracts) to include market.
+            max_pages: Maximum pages to scan (0 = all, ~15 covers popular markets).
+
+        Returns:
+            List of market dicts, each enriched with event_ticker, series_ticker, category.
+        """
+        all_markets: List[Dict[str, Any]] = []
+        cursor = ""
+        page = 0
+        total_events = 0
+        scan_start = time.time()
+
+        # Use a fresh session to avoid any stale connection state
+        scan_session = requests.Session()
+        scan_session.headers.update({"User-Agent": "PredictionMarketResearch/1.0"})
+
+        try:
+            while True:
+                if max_pages > 0 and page >= max_pages:
+                    print(f"  Reached max pages ({max_pages}), stopping scan")
+                    break
+
+                params: Dict[str, Any] = {
+                    "limit": 200,
+                    "with_nested_markets": "true",
+                }
+                if cursor:
+                    params["cursor"] = cursor
+
+                try:
+                    t_req = time.time()
+                    response = scan_session.get(
+                        f"{KALSHI_API}/events", params=params, timeout=30,
+                    )
+                    req_time = time.time() - t_req
+                    if response.status_code == 429:
+                        print(f"  Page {page}: rate-limited, sleeping 3s")
+                        response.close()
+                        time.sleep(3)
+                        continue
+                    response.raise_for_status()
+                    data = response.json()
+                    response.close()
+                except requests.RequestException as e:
+                    print(f"  Page {page}: error: {e}")
+                    break
+
+                events = data.get("events", [])
+                cursor = data.get("cursor", "")
+                del data
+
+                if not events:
+                    break
+
+                page_kept = 0
+                for event in events:
+                    event_ticker = event.get("event_ticker", "")
+                    series_ticker = event.get("series_ticker", "")
+                    category = event.get("category", "")
+                    nested_markets = event.get("markets", [])
+
+                    for m in nested_markets:
+                        vol = m.get("volume", 0) or 0
+                        if min_volume > 0 and vol < min_volume:
+                            continue
+                        m["event_ticker"] = event_ticker
+                        m["series_ticker"] = series_ticker
+                        m["category"] = category
+                        all_markets.append(m)
+                        page_kept += 1
+
+                total_events += len(events)
+                page += 1
+
+                # Print every page with ETA
+                elapsed = time.time() - t_req  # use cumulative later
+                total_elapsed = time.time() - scan_start
+                avg_per_page = total_elapsed / page if page > 0 else 0
+                if max_pages > 0:
+                    pct = page / max_pages * 100
+                    pages_left = max_pages - page
+                    eta = pages_left * avg_per_page
+                    print(f"  Page {page}/{max_pages} ({pct:.0f}%) "
+                          f"{len(events)} events, +{page_kept} mkts "
+                          f"(total={len(all_markets):,}), "
+                          f"{req_time:.1f}s/req, ETA {eta:.0f}s")
+                else:
+                    print(f"  Page {page}: {len(events)} events, "
+                          f"+{page_kept} mkts (total={len(all_markets):,}), "
+                          f"{req_time:.1f}s/req, {total_elapsed:.0f}s elapsed")
+
+                if not cursor:
+                    break
+                time.sleep(0.1)  # gentle rate limit
+        finally:
+            scan_session.close()
+
+        print(f"  Events scan complete: {total_events:,} events, "
+              f"{len(all_markets):,} markets"
+              + (f" with volume >= {min_volume:,.0f}" if min_volume > 0 else ""))
+        return all_markets
+
+    def fetch_kalshi_trades(
+        self,
+        ticker: Optional[str] = None,
+        min_ts: Optional[int] = None,
+        max_ts: Optional[int] = None,
+        limit: int = 1000,
+        max_trades: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Fetch trades from Kalshi API (paginated, no auth, thread-safe)."""
+        session = self._get_session()
+        all_trades: List[Dict[str, Any]] = []
+        cursor = ""
+
+        while True:
+            params: Dict[str, Any] = {"limit": min(limit, 1000)}
+            if cursor:
+                params["cursor"] = cursor
+            if ticker:
+                params["ticker"] = ticker
+            if min_ts is not None:
+                params["min_ts"] = min_ts
+            if max_ts is not None:
+                params["max_ts"] = max_ts
+
+            try:
+                response = session.get(
+                    f"{KALSHI_API}/markets/trades", params=params, timeout=60,
+                )
+                if response.status_code == 429:
+                    time.sleep(2)
+                    continue
+                response.raise_for_status()
+                data = response.json()
+            except requests.RequestException as e:
+                print(f"  Error fetching Kalshi trades ({ticker}): {e}")
+                break
+
+            trades = data.get("trades", [])
+            if not trades:
+                break
+
+            all_trades.extend(trades)
+            if max_trades > 0 and len(all_trades) >= max_trades:
+                all_trades = all_trades[:max_trades]
+                break
+
+            cursor = data.get("cursor", "")
+            if not cursor:
+                break
+            time.sleep(CLOB_REQUEST_DELAY)
+
+        return all_trades
+
+    def fetch_kalshi_candlesticks(
+        self,
+        series_ticker: str,
+        ticker: str,
+        start_ts: Optional[int] = None,
+        end_ts: Optional[int] = None,
+        period_interval: int = 60,
+    ) -> List[Dict[str, Any]]:
+        """Fetch candlestick price data for a Kalshi market (thread-safe).
+
+        Args:
+            series_ticker: Series ticker containing the market
+            ticker: Market ticker
+            start_ts: Start unix timestamp (default: 1 year ago)
+            end_ts: End unix timestamp (default: now)
+            period_interval: Candle size in minutes: 1, 60, or 1440 (default: 60 = hourly)
+
+        Returns:
+            List of candlestick dicts with OHLCV data
+        """
+        session = self._get_session()
+        now = int(time.time())
+        if end_ts is None:
+            end_ts = now
+        if start_ts is None:
+            start_ts = now - (365 * 24 * 60 * 60)
+
+        try:
+            response = session.get(
+                f"{KALSHI_API}/series/{series_ticker}/markets/{ticker}/candlesticks",
+                params={
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "period_interval": period_interval,
+                },
+                timeout=60,
+            )
+            if response.status_code == 429:
+                time.sleep(2)
+                return self.fetch_kalshi_candlesticks(
+                    series_ticker, ticker, start_ts, end_ts, period_interval
+                )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("candlesticks", [])
+        except requests.RequestException:
+            return []
+
+    def _fetch_single_kalshi_market(
+        self,
+        market_row: Dict[str, Any],
+        progress: Dict[str, int],
+        lock: threading.Lock,
+        monthly_trades: Dict[str, List[Dict[str, Any]]],
+        monthly_prices: Dict[str, List[Dict[str, Any]]],
+        max_trades_per_market: int,
+        fetch_trades: bool,
+        fetch_prices: bool,
+    ) -> bool:
+        """Fetch trades + candlesticks for a single market (thread-safe worker)."""
+        ticker = market_row["ticker"]
+        series_ticker = market_row.get("series_ticker", "")
+        event_ticker = market_row.get("event_ticker", "")
+        market_trades = 0
+        market_candles = 0
+
+        try:
+            # ---- Trades ----
+            if fetch_trades:
+                trades = self.fetch_kalshi_trades(
+                    ticker=ticker, max_trades=max_trades_per_market,
+                )
+                for t in trades:
+                    created_time = t.get("created_time", "")
+                    try:
+                        dt = pd.Timestamp(created_time)
+                        month = dt.strftime("%Y-%m")
+                        ts_unix = int(dt.timestamp())
+                    except Exception:
+                        month = "unknown"
+                        ts_unix = 0
+
+                    yes_price = (t.get("yes_price", 0) or 0) / 100.0
+                    no_price = (t.get("no_price", 0) or 0) / 100.0
+
+                    row = {
+                        "trade_id": t.get("trade_id", ""),
+                        "ticker": t.get("ticker", ""),
+                        "event_ticker": event_ticker,
+                        "yes_price": yes_price,
+                        "no_price": no_price,
+                        "count": t.get("count", 0) or 0,
+                        "taker_side": t.get("taker_side", ""),
+                        "created_time": created_time,
+                        "timestamp_unix": ts_unix,
+                    }
+                    with lock:
+                        monthly_trades[month].append(row)
+
+                market_trades = len(trades)
+
+            # ---- Candlestick prices (hourly OHLCV) ----
+            if fetch_prices and series_ticker:
+                candles = self.fetch_kalshi_candlesticks(
+                    series_ticker=series_ticker,
+                    ticker=ticker,
+                    period_interval=1440,  # daily (more reliable than hourly)
+                )
+                for c in candles:
+                    end_ts = c.get("end_period_ts", 0)
+                    price_data = c.get("price", {}) or {}
+                    try:
+                        dt = pd.Timestamp(end_ts, unit="s")
+                        month = dt.strftime("%Y-%m")
+                    except Exception:
+                        month = "unknown"
+
+                    row = {
+                        "ticker": ticker,
+                        "event_ticker": event_ticker,
+                        "timestamp": end_ts,
+                        "open": (price_data.get("open") or 0) / 100.0,
+                        "high": (price_data.get("high") or 0) / 100.0,
+                        "low": (price_data.get("low") or 0) / 100.0,
+                        "close": (price_data.get("close") or 0) / 100.0,
+                        "mean": (price_data.get("mean") or 0) / 100.0,
+                        "volume": c.get("volume", 0) or 0,
+                        "open_interest": c.get("open_interest", 0) or 0,
+                    }
+                    with lock:
+                        monthly_prices[month].append(row)
+
+                market_candles = len(candles)
+
+        except Exception as e:
+            with lock:
+                progress["errors"] += 1
+            return False
+
+        with lock:
+            progress["done"] += 1
+            progress["trades"] += market_trades
+            progress["candles"] += market_candles
+            done = progress["done"]
+            total = progress["total"]
+            if done % 10 == 0 or done == total:
+                elapsed = time.time() - progress["start_time"]
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = (total - done) / rate if rate > 0 else 0
+                pct = done / total * 100 if total > 0 else 0
+                print(
+                    f"  [{done}/{total}] {pct:.0f}%  "
+                    f"trades={progress['trades']:,}  candles={progress['candles']:,}  "
+                    f"errors={progress['errors']}  "
+                    f"{rate:.1f} mkts/s  ETA {eta:.0f}s"
+                )
+
+        return True
+
+    def fetch_kalshi_data(
+        self,
+        min_volume: float = 0,
+        include_settled: bool = True,
+        fetch_trades: bool = True,
+        fetch_prices: bool = True,
+        max_trades_per_market: int = 10000,
+        workers: int = MAX_WORKERS,
+        flush_interval: int = 10,
+        max_event_pages: int = 0,
+    ) -> Dict[str, int]:
+        """
+        Fetch Kalshi events, markets, trades, and price candlesticks.
+        Saves to data/kalshi/ as parquet. Parallelized with checkpoints.
+
+        Uses the events endpoint (with nested markets) for fast discovery
+        of high-volume markets, rather than scanning 100k+ /markets pages.
+
+        No authentication required — all endpoints are public market data.
+
+        Args:
+            min_volume: Minimum total volume (contracts) to include market
+            include_settled: Include settled markets
+            fetch_trades: Fetch individual trade history per market
+            fetch_prices: Fetch hourly candlestick price history per market
+            max_trades_per_market: Max trades to fetch per market (default 10000)
+            workers: Concurrent worker threads (default: 20)
+            flush_interval: Flush to disk every N markets (default: 50)
+            max_event_pages: Max event pages to scan (0=all, ~15 covers popular markets)
+
+        Returns:
+            Dict with counts of events, markets, trades, candles
+        """
+        self._require_pyarrow()
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        t0 = time.time()
+        kalshi_dir = self.data_dir / "kalshi"
+        kalshi_dir.mkdir(parents=True, exist_ok=True)
+        trades_dir = kalshi_dir / "trades"
+        trades_dir.mkdir(parents=True, exist_ok=True)
+        prices_dir = kalshi_dir / "prices"
+        prices_dir.mkdir(parents=True, exist_ok=True)
+
+        # ---- Checkpoint ----
+        checkpoint_path = kalshi_dir / "fetch_checkpoint.json"
+        processed_tickers: Set[str] = set()
+        if checkpoint_path.exists():
+            try:
+                with open(checkpoint_path, "r") as f:
+                    ckpt = json.load(f)
+                    processed_tickers = set(ckpt.get("processed_tickers", []))
+                    if processed_tickers:
+                        print(f"  Resuming: {len(processed_tickers):,} markets already processed")
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        # ================================================================
+        # Step 1: Fetch markets via events (fast: finds high-volume
+        # markets immediately instead of scanning 100k+ sports parlays)
+        # ================================================================
+        print(f"\n[Kalshi 1/2] Fetching markets via events (volume >= {min_volume:,.0f})...")
+        raw_markets = self.fetch_kalshi_markets_via_events(
+            min_volume=min_volume, max_pages=max_event_pages,
+        )
+        print(f"  Got {len(raw_markets):,} qualifying markets in {time.time()-t0:.1f}s")
+
+        if not raw_markets:
+            print("  No markets meeting volume threshold.")
+            print("  Tip: Kalshi volumes are in contracts. Try --kalshi-min-volume 1000")
+            return {"events": 0, "markets": 0, "trades": 0, "candles": 0}
+
+        markets_rows = []
+        event_meta: Dict[str, Dict[str, str]] = {}
+        for m in raw_markets:
+            vol = m.get("volume", 0) or 0
+            vol_24h = m.get("volume_24h", 0) or 0
+            et = m.get("event_ticker", "")
+            st = m.get("series_ticker", "")
+            cat = m.get("category", "")
+            markets_rows.append({
+                "ticker": m.get("ticker", ""),
+                "event_ticker": et,
+                "series_ticker": st,
+                "market_type": m.get("market_type", ""),
+                "title": str(m.get("title", ""))[:200],
+                "subtitle": str(m.get("subtitle", ""))[:200],
+                "status": m.get("status", ""),
+                "result": m.get("result", ""),
+                "yes_bid": m.get("yes_bid"),
+                "yes_ask": m.get("yes_ask"),
+                "no_bid": m.get("no_bid"),
+                "no_ask": m.get("no_ask"),
+                "last_price": m.get("last_price"),
+                "volume": int(vol),
+                "volume_24h": int(vol_24h),
+                "open_interest": m.get("open_interest", 0) or 0,
+                "liquidity": m.get("liquidity", 0) or 0,
+                "created_time": m.get("created_time", ""),
+                "open_time": m.get("open_time", ""),
+                "close_time": m.get("close_time", ""),
+                "expiration_time": m.get("expiration_time", ""),
+                "settlement_value": m.get("settlement_value"),
+                "category": cat,
+            })
+            # Track event metadata (already available from events endpoint)
+            if et and et not in event_meta:
+                event_meta[et] = {"series_ticker": st, "category": cat}
+        del raw_markets
+
+        markets_df = pd.DataFrame(markets_rows)
+        pq.write_table(
+            pa.Table.from_pandas(markets_df, preserve_index=False),
+            kalshi_dir / "markets.parquet", compression="zstd", compression_level=3,
+        )
+        print(f"  Saved {len(markets_df):,} markets with series_tickers already resolved")
+
+        # Stats
+        if not markets_df.empty:
+            status_counts = markets_df["status"].value_counts()
+            print(f"  Saved {len(markets_df):,} markets")
+            for s, c in status_counts.items():
+                print(f"    {s}: {c:,}")
+            vol_markets = markets_df[markets_df["volume"] > 0]
+            print(f"  Markets with volume > 0: {len(vol_markets):,}")
+            if not vol_markets.empty:
+                print(f"  Total volume: {vol_markets['volume'].sum():,.0f} contracts")
+
+        # ================================================================
+        # Filter markets for trade/price fetching
+        # ================================================================
+        target_markets = markets_df[markets_df["volume"] >= min_volume].copy()
+        if not include_settled:
+            target_markets = target_markets[~target_markets["status"].isin(["settled"])]
+        target_markets = target_markets.sort_values("volume", ascending=False)
+
+        # Remove already-processed
+        remaining = target_markets[~target_markets["ticker"].isin(processed_tickers)]
+        already = len(target_markets) - len(remaining)
+
+        do_detail = (fetch_trades or fetch_prices) and not remaining.empty
+        if not do_detail:
+            result = {
+                "events": len(event_meta), "markets": len(markets_df),
+                "trades": 0, "candles": 0,
+            }
+            print(f"\n[Kalshi] Complete in {time.time()-t0:.1f}s")
+            for k, v in result.items():
+                print(f"  {k}: {v:,}")
+            return result
+
+        print(f"\n[Kalshi 2/2] Fetching trades & prices for {len(remaining):,} markets "
+              f"(volume >= {min_volume:,.0f}, {already} already done)")
+        print(f"  Workers: {workers}  Flush interval: {flush_interval}")
+
+        # ================================================================
+        # Parallel fetch trades + candlesticks
+        # ================================================================
+        lock = threading.Lock()
+        monthly_trades: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        monthly_prices: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        progress = {
+            "done": 0, "total": len(remaining), "trades": 0,
+            "candles": 0, "errors": 0, "start_time": time.time(),
+        }
+
+        market_dicts = remaining.to_dict("records")
+        markets_since_flush = 0
+
+        try:
+            for batch_start in range(0, len(market_dicts), workers):
+                batch = market_dicts[batch_start:batch_start + workers]
+
+                with ThreadPoolExecutor(max_workers=min(workers, len(batch))) as executor:
+                    futures = {
+                        executor.submit(
+                            self._fetch_single_kalshi_market,
+                            m, progress, lock,
+                            monthly_trades, monthly_prices,
+                            max_trades_per_market, fetch_trades, fetch_prices,
+                        ): m
+                        for m in batch
+                    }
+                    for future in as_completed(futures):
+                        m = futures[future]
+                        try:
+                            future.result()
+                            processed_tickers.add(m["ticker"])
+                            markets_since_flush += 1
+                        except Exception as e:
+                            with lock:
+                                progress["errors"] += 1
+
+                # Flush periodically
+                with lock:
+                    total_rows = (
+                        sum(len(v) for v in monthly_trades.values()) +
+                        sum(len(v) for v in monthly_prices.values())
+                    )
+                if markets_since_flush >= flush_interval or total_rows > 100_000:
+                    self._flush_kalshi_trades(monthly_trades, trades_dir, lock)
+                    self._flush_kalshi_prices(monthly_prices, prices_dir, lock)
+                    self._save_kalshi_checkpoint(checkpoint_path, processed_tickers)
+                    markets_since_flush = 0
+
+        except KeyboardInterrupt:
+            print("\n  Interrupted! Flushing shards...")
+            self._flush_kalshi_trades(monthly_trades, trades_dir, lock)
+            self._flush_kalshi_prices(monthly_prices, prices_dir, lock)
+            self._save_kalshi_checkpoint(checkpoint_path, processed_tickers)
+            # Combine shards written so far
+            print("  Combining shards written so far...")
+            if fetch_trades:
+                self._combine_kalshi_shards(
+                    trades_dir, "trades", dedup_cols=["trade_id"], sort_col="timestamp_unix",
+                )
+            if fetch_prices:
+                self._combine_kalshi_shards(
+                    prices_dir, "prices", dedup_cols=["ticker", "timestamp"], sort_col="timestamp",
+                )
+            print(f"  Checkpoint saved ({len(processed_tickers):,} markets). Re-run to resume.")
+            raise
+
+        # Final flush
+        self._flush_kalshi_trades(monthly_trades, trades_dir, lock)
+        self._flush_kalshi_prices(monthly_prices, prices_dir, lock)
+        self._save_kalshi_checkpoint(checkpoint_path, processed_tickers)
+
+        # Combine shards into final monthly files
+        print(f"\n  Combining shards...")
+        if fetch_trades:
+            trade_rows = self._combine_kalshi_shards(
+                trades_dir, "trades", dedup_cols=["trade_id"], sort_col="timestamp_unix",
+            )
+            print(f"  Trades: {trade_rows:,} rows total")
+        if fetch_prices:
+            price_rows = self._combine_kalshi_shards(
+                prices_dir, "prices", dedup_cols=["ticker", "timestamp"], sort_col="timestamp",
+            )
+            print(f"  Prices: {price_rows:,} rows total")
+
+        elapsed = time.time() - t0
+        result = {
+            "events": len(event_meta),
+            "markets": len(markets_df),
+            "trades": progress["trades"],
+            "candles": progress["candles"],
+        }
+
+        print(f"\n[Kalshi] Complete in {elapsed:.1f}s")
+        print(f"  Events:  {result['events']:,}")
+        print(f"  Markets: {result['markets']:,}")
+        print(f"  Trades:  {result['trades']:,}")
+        print(f"  Candles: {result['candles']:,}")
+        print(f"  Errors:  {progress['errors']}")
+        print(f"  Data:    {kalshi_dir}")
+
+        return result
+
+    def _flush_kalshi_trades(
+        self,
+        monthly_trades: Dict[str, List[Dict[str, Any]]],
+        trades_dir: Path,
+        lock: Optional[threading.Lock] = None,
+    ) -> None:
+        """Flush accumulated Kalshi trades as shard files (fast, no read-back)."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        if lock:
+            with lock:
+                data = {k: list(v) for k, v in monthly_trades.items()}
+                monthly_trades.clear()
+        else:
+            data = dict(monthly_trades)
+            monthly_trades.clear()
+
+        shard_id = int(time.time() * 1000) % 1_000_000_000
+        for month, rows in data.items():
+            if not rows:
+                continue
+            df = pd.DataFrame(rows)
+            shard_path = trades_dir / f"trades_{month}_shard{shard_id}.parquet"
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            pq.write_table(table, shard_path, compression="zstd", compression_level=3)
+
+    def _flush_kalshi_prices(
+        self,
+        monthly_prices: Dict[str, List[Dict[str, Any]]],
+        prices_dir: Path,
+        lock: Optional[threading.Lock] = None,
+    ) -> None:
+        """Flush accumulated Kalshi prices as shard files (fast, no read-back)."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        if lock:
+            with lock:
+                data = {k: list(v) for k, v in monthly_prices.items()}
+                monthly_prices.clear()
+        else:
+            data = dict(monthly_prices)
+            monthly_prices.clear()
+
+        shard_id = int(time.time() * 1000) % 1_000_000_000
+        for month, rows in data.items():
+            if not rows:
+                continue
+            df = pd.DataFrame(rows)
+            shard_path = prices_dir / f"prices_{month}_shard{shard_id}.parquet"
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            pq.write_table(table, shard_path, compression="zstd", compression_level=3)
+
+    def _combine_kalshi_shards(
+        self,
+        target_dir: Path,
+        prefix: str,
+        dedup_cols: List[str],
+        sort_col: str,
+    ) -> int:
+        """Combine shard parquet files into final monthly files, then delete shards.
+
+        Returns total rows written.
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        # Group shards by month: prefix_YYYY-MM_shardNNN.parquet -> YYYY-MM
+        shard_files: Dict[str, List[Path]] = defaultdict(list)
+        for f in target_dir.glob(f"{prefix}_*_shard*.parquet"):
+            stem = f.stem  # e.g. prices_2025-06_shard123456
+            month = stem.split("_shard")[0].replace(f"{prefix}_", "")
+            shard_files[month].append(f)
+
+        if not shard_files:
+            return 0
+
+        total_rows = 0
+        for month, shards in sorted(shard_files.items()):
+            final_path = target_dir / f"{prefix}_{month}.parquet"
+
+            dfs = []
+            # Include existing final file if present
+            if final_path.exists():
+                try:
+                    dfs.append(pd.read_parquet(final_path))
+                except Exception:
+                    pass
+            for shard in shards:
+                try:
+                    dfs.append(pd.read_parquet(shard))
+                except Exception:
+                    pass
+
+            if not dfs:
+                continue
+
+            combined = pd.concat(dfs, ignore_index=True)
+            combined = combined.drop_duplicates(subset=dedup_cols, keep="last")
+            combined = combined.sort_values(sort_col).reset_index(drop=True)
+
+            pq.write_table(
+                pa.Table.from_pandas(combined, preserve_index=False),
+                final_path, compression="zstd", compression_level=3,
+            )
+            total_rows += len(combined)
+
+            # Delete shards
+            for shard in shards:
+                try:
+                    shard.unlink()
+                except OSError:
+                    pass
+
+            print(f"    {prefix}_{month}.parquet: {len(combined):,} rows "
+                  f"(from {len(shards)} shards)")
+
+        return total_rows
+
+    def _save_kalshi_checkpoint(self, checkpoint_path: Path, processed_tickers: Set[str]) -> None:
+        """Save Kalshi fetch checkpoint."""
+        try:
+            ckpt = {
+                "processed_tickers": sorted(list(processed_tickers)),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "count": len(processed_tickers),
+            }
+            tmp = checkpoint_path.with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                json.dump(ckpt, f, indent=2)
+            tmp.replace(checkpoint_path)
+        except IOError as e:
+            print(f"  Warning: Could not save checkpoint: {e}")
+
+    # =========================================================================
     # CONVENIENCE METHODS
     # =========================================================================
 
@@ -1590,8 +2467,8 @@ class DataFetcher:
         manifold_dir = self.data_dir / "manifold"
         polymarket_dir = self.data_dir / "polymarket"
         polymarket_clob_dir = self.data_dir / "polymarket_clob"
-        order_filled_dir = Path("data/parquet/order_filled_events")
-        trades_parquet_dir = Path("data/parquet/trades")
+        order_filled_dir = Path("data/polymarket/order_filled_events")
+        trades_parquet_dir = Path("data/polymarket/trades")
 
         return {
             "manifold_bets": list(manifold_dir.glob("bets_*.json")) if manifold_dir.exists() else [],

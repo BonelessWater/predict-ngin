@@ -146,13 +146,13 @@ def _to_datetime_safe(value: Any) -> Optional[pd.Timestamp]:
 
 def _load_market_close_dates(
     market_ids: Iterable[Any],
-    parquet_dir: str = "data/parquet/markets",
+    parquet_dir: str = "data/polymarket",
     db_path: str = "data/prediction_markets.db",
 ) -> Dict[str, pd.Timestamp]:
     """
     Load Polymarket market end dates for the given market IDs.
 
-    Prefers parquet (data/parquet/markets) and falls back to SQLite.
+    Prefers parquet (data/polymarket) and falls back to SQLite.
     Returns mapping of market_id -> close_date (pd.Timestamp).
     """
     ids = {str(mid).replace(".0", "") for mid in market_ids if mid is not None}
@@ -163,30 +163,29 @@ def _load_market_close_dates(
 
     # Prefer parquet markets if available
     pq_path = Path(parquet_dir)
-    pq_files = sorted(pq_path.glob("markets_*.parquet")) if pq_path.exists() else []
+    single = pq_path / "markets.parquet"
+    pq_files = [single] if single.exists() else (sorted(pq_path.glob("markets_*.parquet")) if pq_path.exists() else [])
     if pq_files and pl is not None:
         try:
-            lf = pl.scan_parquet([str(f) for f in pq_files]).select(
-                [
-                    pl.col("id").cast(pl.Utf8).alias("market_id"),
-                    pl.col("endDate"),
-                    pl.col("endDateIso"),
-                    pl.col("closedTime"),
-                ]
-            )
-            lf = lf.with_columns(pl.col("market_id").str.replace(r"\.0$", ""))
-            lf = lf.filter(pl.col("market_id").is_in(list(ids)))
+            lf = pl.scan_parquet([str(f) for f in pq_files])
+            schema = lf.collect_schema()
+            # Support both polymarket (end_date) and parquet (endDate, endDateIso, closedTime) schemas
+            cols = [pl.col("id").cast(pl.Utf8).alias("market_id")]
+            for c in ["endDateIso", "endDate", "closedTime", "end_date"]:
+                if c in schema.names():
+                    cols.append(pl.col(c))
+            lf = lf.select(cols).with_columns(
+                pl.col("market_id").str.replace(r"\.0$", "")
+            ).filter(pl.col("market_id").is_in(list(ids)))
             df = lf.collect().to_pandas()
             if not df.empty:
                 for _, row in df.iterrows():
                     mid = str(row.get("market_id", "")).replace(".0", "")
                     if not mid:
                         continue
-                    end_val = row.get("endDateIso")
+                    end_val = row.get("endDateIso") or row.get("endDate") or row.get("closedTime") or row.get("end_date")
                     if end_val is None or (isinstance(end_val, float) and np.isnan(end_val)):
-                        end_val = row.get("endDate")
-                    if end_val is None or (isinstance(end_val, float) and np.isnan(end_val)):
-                        end_val = row.get("closedTime")
+                        continue
                     dt = _to_datetime_safe(end_val)
                     if dt is not None and not pd.isna(dt):
                         close_dates[mid] = dt

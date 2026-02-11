@@ -28,6 +28,13 @@ data:
     request_delay: 0.1
     max_workers: 20
 
+  # Kalshi
+  kalshi:
+    api_url: "https://api.elections.kalshi.com/trade-api/v2"
+    data_dir: "data/kalshi"
+    min_volume: 0  # Minimum volume to fetch trades
+    request_delay: 0.1
+
   # Manifold
   manifold:
     api_url: "https://api.manifold.markets/v0"
@@ -114,13 +121,28 @@ strategies:
       min: 0.15
       max: 0.85
 
-  # Cross Market
+  # Cross Market (within single platform)
   cross_market:
     enabled: false # Experimental
     z_score_threshold: 2.0
     lookback_hours: 72
     min_spread_pct: 0.05
     max_spread_pct: 0.30
+
+  # Cross-Platform Arbitrage (Polymarket vs Kalshi)
+  arbitrage:
+    enabled: false  # Experimental
+    entry_spread: 0.05  # Minimum spread to enter (5 cents)
+    exit_spread: 0.01   # Close when spread narrows to this
+    min_expected_profit: 0.02  # Minimum profit after fees
+    z_score_threshold: 1.5
+    lookback_periods: 30  # Rolling window for spread stats
+    max_holding_periods: null  # No forced exit by default
+    min_match_confidence: 0.40  # Minimum market match score
+    resample_freq: "1D"  # Daily spread sampling
+    # Fee assumptions
+    polymarket_profit_fee: 0.0
+    kalshi_profit_fee: 0.07
 
 # =============================================================================
 # ENSEMBLE

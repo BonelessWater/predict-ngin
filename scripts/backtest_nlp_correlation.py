@@ -34,7 +34,7 @@ from src.trading.momentum_signals_from_trades import trades_to_price_history
 
 def load_random_markets(
     n_markets: int = 500,
-    parquet_markets_dir: str = "data/parquet/markets",
+    parquet_markets_dir: str = "data/polymarket",
     seed: Optional[int] = None,
 ) -> pd.DataFrame:
     """
@@ -50,8 +50,9 @@ def load_random_markets(
     markets_path = Path(parquet_markets_dir)
     if not markets_path.exists():
         raise FileNotFoundError(f"Markets directory not found: {parquet_markets_dir}")
-    
-    markets_files = list(markets_path.glob("markets_*.parquet"))
+
+    single = markets_path / "markets.parquet"
+    markets_files = [single] if single.exists() else list(markets_path.glob("markets_*.parquet"))
     if not markets_files:
         raise FileNotFoundError(f"No markets parquet files found in {parquet_markets_dir}")
     
@@ -196,9 +197,9 @@ def generate_signals_for_backtest(
 
 def run_backtest(
     n_markets: int = 500,
-    parquet_markets_dir: str = "data/parquet/markets",
-    parquet_prices_dir: str = "data/parquet/prices",
-    parquet_trades_dir: str = "data/parquet/trades",
+    parquet_markets_dir: str = "data/polymarket",
+    parquet_prices_dir: str = "data/polymarket/prices",
+    parquet_trades_dir: str = "data/polymarket/trades",
     use_trades: bool = True,
     similarity_method: str = "hybrid",
     min_similarity: float = 0.4,
@@ -372,19 +373,19 @@ def main():
     parser.add_argument(
         "--parquet-markets-dir",
         type=str,
-        default="data/parquet/markets",
+        default="data/polymarket",
         help="Directory with markets parquet files",
     )
     parser.add_argument(
         "--parquet-prices-dir",
         type=str,
-        default="data/parquet/prices",
+        default="data/polymarket/prices",
         help="Directory with prices parquet files",
     )
     parser.add_argument(
         "--parquet-trades-dir",
         type=str,
-        default="data/parquet/trades",
+        default="data/polymarket/trades",
         help="Directory with trades parquet files",
     )
     parser.add_argument(

@@ -55,13 +55,14 @@ def load_data(
     trades_df = None
     
     # Try parquet first (preferred)
-    parquet_markets_path = Path(parquet_markets_dir or "data/parquet/markets")
-    parquet_prices_path = Path(parquet_prices_dir or "data/parquet/prices")
-    parquet_trades_path = Path(parquet_trades_dir or "data/parquet/trades")
-    
+    parquet_markets_path = Path(parquet_markets_dir or "data/polymarket")
+    parquet_prices_path = Path(parquet_prices_dir or "data/polymarket/prices")
+    parquet_trades_path = Path(parquet_trades_dir or "data/polymarket/trades")
+
     # Load markets from parquet if available
     if parquet_markets_path.exists():
-        markets_files = list(parquet_markets_path.glob("markets_*.parquet"))
+        single = parquet_markets_path / "markets.parquet"
+        markets_files = [single] if single.exists() else list(parquet_markets_path.glob("markets_*.parquet"))
         if markets_files:
             print(f"Loading markets from parquet ({len(markets_files)} files)...")
             markets_list = []
@@ -340,19 +341,19 @@ Examples:
     parser.add_argument(
         "--parquet-markets-dir",
         type=str,
-        default="data/parquet/markets",
+        default="data/polymarket",
         help="Directory with markets parquet files",
     )
     parser.add_argument(
         "--parquet-prices-dir",
         type=str,
-        default="data/parquet/prices",
+        default="data/polymarket/prices",
         help="Directory with prices parquet files",
     )
     parser.add_argument(
         "--parquet-trades-dir",
         type=str,
-        default="data/parquet/trades",
+        default="data/polymarket/trades",
         help="Directory with trades parquet files",
     )
     parser.add_argument(

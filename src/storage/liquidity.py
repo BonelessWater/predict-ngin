@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from src.collection.liquidity import LiquiditySnapshot
 
 
-DEFAULT_LIQUIDITY_DIR = "data/parquet/liquidity"
+DEFAULT_LIQUIDITY_DIR = "data/polymarket/liquidity"
 
 
 class LiquidityStore(BaseStore["LiquiditySnapshot"]):

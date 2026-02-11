@@ -260,7 +260,7 @@ class PredictionMarketDB:
 
     def import_polymarket_trades_parquet(
         self,
-        trades_dir: str = "data/parquet/trades",
+        trades_dir: str = "data/polymarket/trades",
         chunk_size: int = 200000,
     ) -> Dict[str, int]:
         """
@@ -692,7 +692,7 @@ def build_database(
     import_manifold: bool = True,
     import_manifold_markets: bool = True,
     import_polymarket_trades: bool = False,
-    polymarket_trades_path: str = "data/parquet/trades",
+    polymarket_trades_path: str = "data/polymarket/trades",
 ) -> PredictionMarketDB:
     """
     Build/update the prediction market database.
