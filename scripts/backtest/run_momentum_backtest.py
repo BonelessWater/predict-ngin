@@ -125,7 +125,7 @@ def main() -> int:
     config = _load_config()
     parquet_dir = args.parquet_dir or (config and config.database.parquet_dir + "/prices") or "data/polymarket/prices"
     db_path = args.db_path or (config and config.database.path) or "data/prediction_markets.db"
-    output_dir = args.output_dir or (config and config.backtest.output_dir) or "data/output"
+    output_dir = args.output_dir or (config and config.backtest.output_dir) or "data/research"
     position_size = args.position_size
     if position_size is None and config:
         position_size = getattr(config.backtest, "default_position_size", 250)

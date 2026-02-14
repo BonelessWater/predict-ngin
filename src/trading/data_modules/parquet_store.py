@@ -444,18 +444,21 @@ class PriceStore:
         for f in sorted(self._effective_dir().glob("prices_*.parquet")):
             try:
                 df = pd.read_parquet(
-                    f,
+                    str(f),
                     filters=[
                         ("market_id", "in", market_ids_str),
                         ("outcome", "==", outcome),
                     ],
                 )
             except Exception:
-                df = pd.read_parquet(f)
-                df = df[
-                    (df["market_id"].isin(market_ids_str))
-                    & (df["outcome"] == outcome)
-                ]
+                try:
+                    df = pd.read_parquet(str(f))
+                    df = df[
+                        (df["market_id"].astype(str).isin(market_ids_str))
+                        & (df["outcome"].astype(str).str.upper() == outcome.upper())
+                    ]
+                except Exception:
+                    continue  # Skip corrupted or invalid parquet files
             if not df.empty:
                 dfs.append(df)
 

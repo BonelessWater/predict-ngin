@@ -2,7 +2,8 @@
 """
 Quick script to populate the database for NLP correlation strategy.
 
-This fetches Polymarket markets and prices, then builds the database.
+DEPRECATED: Use data/research and fetch_research_trades_and_prices.py instead.
+This script will be removed.
 """
 
 import sys
@@ -17,6 +18,7 @@ from src.trading.data_modules.database import build_database, DEFAULT_DB_PATH
 
 
 def main():
+    print("⚠️  DEPRECATED: Use data/research and fetch_research_trades_and_prices.py instead.")
     print("=" * 60)
     print("POPULATING DATABASE FOR NLP CORRELATION STRATEGY")
     print("=" * 60)
@@ -75,7 +77,7 @@ def main():
         print("   Try running: python run.py --fetch-clob")
     else:
         print("\n✅ Database populated successfully!")
-        print(f"   You can now run: python scripts/run_nlp_correlation.py")
+        print("   Prefer: python scripts/data/fetch_research_trades_and_prices.py --research-dir data/research")
     
     db.close()
 

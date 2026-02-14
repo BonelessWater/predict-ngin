@@ -74,26 +74,6 @@ Tests for CLI utilities (`src/tools/cli_utils.py`).
 pytest tests/test_cli_utils.py -v
 ```
 
-### `unit/test_liquidity_analyzer.py`
-
-Tests for liquidity analyzer script (`scripts/analysis/liquidity_analyzer.py`).
-
-**Coverage:**
-
-- Loading liquidity snapshots (with filters)
-- Loading liquidity estimates
-- Analyzing liquidity trends
-- Market liquidity analysis
-- Identifying liquidity issues
-- Report generation
-- Edge cases (empty database, missing data)
-
-**Run tests:**
-
-```bash
-pytest tests/unit/test_liquidity_analyzer.py -v
-```
-
 ### `unit/test_dashboard.py`
 
 Tests for dashboard script (`scripts/monitoring/dashboard.py`).
@@ -119,10 +99,10 @@ pytest tests/unit/test_dashboard.py -v
 
 ```bash
 # Run all new tests
-pytest tests/test_attribution.py tests/test_parameter_tuning.py tests/test_cli_utils.py tests/unit/test_liquidity_analyzer.py tests/unit/test_dashboard.py -v
+pytest tests/test_attribution.py tests/test_parameter_tuning.py tests/test_cli_utils.py tests/unit/test_dashboard.py -v
 
 # Run with coverage
-pytest tests/test_attribution.py tests/test_parameter_tuning.py tests/test_cli_utils.py tests/unit/test_liquidity_analyzer.py tests/unit/test_dashboard.py --cov=src.trading.attribution --cov=src.trading.parameter_tuning --cov=src.tools.cli_utils --cov-report=html
+pytest tests/test_attribution.py tests/test_parameter_tuning.py tests/test_cli_utils.py tests/unit/test_dashboard.py --cov=src.trading.attribution --cov=src.trading.parameter_tuning --cov=src.tools.cli_utils --cov-report=html
 ```
 
 ## Test Fixtures

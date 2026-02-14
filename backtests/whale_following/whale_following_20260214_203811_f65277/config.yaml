@@ -1,0 +1,5 @@
+whale:
+  capital: 1000000
+  min_usd: 100
+  train_ratio: 0.3
+whale_config: WhaleConfig(mode=volume_only, WR>=50% surprise>0)

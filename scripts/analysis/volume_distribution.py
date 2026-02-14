@@ -4,6 +4,7 @@ Analyze the distribution of volume across all Polymarket markets.
 
 import sys
 from pathlib import Path
+from typing import Optional
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -22,167 +23,137 @@ def analyze_volume_distribution(
     db_path: str = "data/prediction_markets.db",
     use_trades: bool = False,
     parquet_trades_dir: str = "data/polymarket/trades",
+    parquet_markets_dir: str = "data/polymarket",
+    use_db: bool = False,
 ):
-    """Analyze volume distribution across all markets."""
+    """Analyze volume distribution across all markets. Uses parquet by default (no DB)."""
     
     df = None
     volume_col = "volume_24hr"
-    
-    # Try to get volume from markets table first
-    if not use_trades:
-        print("Loading market volume data from database...")
-        db = PredictionMarketDB(db_path)
-        
-        query = """
-            SELECT 
-                id,
-                slug,
-                question,
-                volume_24hr,
-                volume,
-                liquidity
-            FROM polymarket_markets
-            WHERE volume_24hr IS NOT NULL AND volume_24hr > 0
-            ORDER BY volume_24hr DESC
-        """
-        
-        df = db.query(query)
-        db.close()
-        
-        if not df.empty:
-            print(f"Found {len(df):,} markets with volume_24hr data")
-        else:
-            print("No volume_24hr data in markets table, trying volume column...")
-            query2 = """
-                SELECT 
-                    id,
-                    slug,
-                    question,
-                    volume as volume_24hr,
-                    volume,
-                    liquidity
-                FROM polymarket_markets
-                WHERE volume IS NOT NULL AND volume > 0
-                ORDER BY volume DESC
-            """
-            db = PredictionMarketDB(db_path)
-            df = db.query(query2)
-            db.close()
-            
-            if not df.empty:
-                print(f"Found {len(df):,} markets with volume data")
-    
-    # If still no data, calculate from trades
-    if df is None or df.empty:
-        print("\nCalculating volume from trades data...")
-        
-        # Try database trades table first
-        db = PredictionMarketDB(db_path)
-        trades_query = """
-            SELECT 
-                market_id,
-                SUM(usd_amount) as volume_24hr,
-                COUNT(*) as trade_count
-            FROM polymarket_trades
-            WHERE usd_amount IS NOT NULL AND usd_amount > 0
-            GROUP BY market_id
-            ORDER BY volume_24hr DESC
-        """
-        
-        volume_df = db.query(trades_query)
-        
-        if not volume_df.empty:
-            print(f"Found volume data for {len(volume_df):,} markets from trades table")
-            
-            # Get market metadata
-            markets_query = """
-                SELECT DISTINCT
-                    id,
-                    slug,
-                    question,
-                    liquidity
-                FROM polymarket_markets
-            """
-            markets_df = db.query(markets_query)
-            db.close()
-            
-            # Merge volume with market metadata
-            if not markets_df.empty:
-                df = volume_df.merge(
-                    markets_df,
-                    left_on="market_id",
-                    right_on="id",
-                    how="left"
-                )
-            else:
-                df = volume_df.copy()
-                df["id"] = df["market_id"]
-                df["slug"] = None
-                df["question"] = None
-                df["liquidity"] = None
-            df["volume"] = df["volume_24hr"]  # For consistency
-        else:
-            # Try parquet trades
-            print("Trying parquet trades directory...")
+
+    # 1. Try parquet markets first (default: all data in parquets)
+    if not use_db:
+        pm_path = Path(parquet_markets_dir)
+        if pm_path.exists():
+            single = pm_path / "markets.parquet"
+            markets_files = [single] if single.exists() else list(pm_path.glob("markets_*.parquet"))
+            if markets_files:
+                print("Loading market volume from parquet...")
+                try:
+                    markets_list = [pd.read_parquet(f) for f in markets_files]
+                    df = pd.concat(markets_list, ignore_index=True)
+                    if "id" not in df.columns and "ID" in df.columns:
+                        df["id"] = df["ID"]
+                    df["id"] = df["id"].astype(str)
+                    if "market_id" not in df.columns:
+                        df["market_id"] = df["id"]
+                    if "volume24hr" in df.columns:
+                        df["volume_24hr"] = df["volume24hr"]
+                    if "volume_24hr" not in df.columns and "volume" in df.columns:
+                        df["volume_24hr"] = df["volume"]
+                    if "volume_24hr" not in df.columns:
+                        df["volume_24hr"] = 0
+                    if "volume" not in df.columns:
+                        df["volume"] = df["volume_24hr"].fillna(0)
+                    df = df[df["volume_24hr"].fillna(0) > 0].copy()
+                    df = df.sort_values("volume_24hr", ascending=False).reset_index(drop=True)
+                    if not df.empty:
+                        print(f"Found {len(df):,} markets with volume from parquet")
+                except Exception as e:
+                    print(f"Parquet markets load failed: {e}")
+                    df = None
+
+    # 2. If no parquet markets or use_trades requested, try parquet trades (no DB)
+    if (df is None or df.empty) and not use_db:
+        print("Trying parquet trades...")
+        try:
+            from src.trading.data_modules.parquet_store import TradeStore
+            trade_store = TradeStore(parquet_trades_dir)
+            if trade_store.available():
+                trades_df = trade_store.load_trades()
+                if not trades_df.empty and "usd_amount" in trades_df.columns:
+                    print(f"Loaded {len(trades_df):,} trades from parquet")
+                    volume_df = trades_df.groupby("market_id").agg({
+                        "usd_amount": "sum",
+                        "market_id": "count"
+                    }).rename(columns={"usd_amount": "volume_24hr", "market_id": "trade_count"})
+                    volume_df = volume_df.reset_index()
+                    df = volume_df.copy()
+                    df["id"] = df["market_id"].astype(str)
+                    df["slug"] = None
+                    df["question"] = "Market " + df["market_id"].astype(str)
+                    df["volume"] = df["volume_24hr"]
+                    df["liquidity"] = None
+                    df = df.sort_values("volume_24hr", ascending=False).reset_index(drop=True)
+                    print(f"Calculated volume for {len(df):,} markets from parquet trades")
+        except Exception as e:
+            print(f"Parquet trades load failed: {e}")
+            if df is None:
+                df = pd.DataFrame()
+
+    # 3. Fallback to DB only when requested or parquet not available
+    if (df is None or df.empty) or use_db:
+        if not use_db and (df is None or df.empty):
+            print("Parquet had no data, trying database...")
+        if not use_trades:
+            print("Loading market volume data from database...")
             try:
-                from src.trading.data_modules.parquet_store import TradeStore
-                
-                trade_store = TradeStore(parquet_trades_dir)
-                if trade_store.available():
-                    print("Loading trades from parquet...")
-                    trades_df = trade_store.load_trades()
-                    
-                    if not trades_df.empty and "usd_amount" in trades_df.columns:
-                        print(f"Loaded {len(trades_df):,} trades")
-                        volume_df = trades_df.groupby("market_id").agg({
-                            "usd_amount": "sum",
-                            "market_id": "count"
-                        }).rename(columns={"usd_amount": "volume_24hr", "market_id": "trade_count"})
-                        volume_df = volume_df.reset_index()
-                        
-                        # Get market metadata from database
-                        db = PredictionMarketDB(db_path)
-                        markets_query = """
-                            SELECT DISTINCT
-                                id,
-                                slug,
-                                question,
-                                liquidity
-                            FROM polymarket_markets
-                        """
-                        markets_df = db.query(markets_query)
-                        db.close()
-                        
-                        # Merge
-                        if not markets_df.empty:
-                            df = volume_df.merge(
-                                markets_df,
-                                left_on="market_id",
-                                right_on="id",
-                                how="left"
-                            )
-                        else:
-                            df = volume_df.copy()
-                            df["id"] = df["market_id"]
-                            df["slug"] = None
-                            df["question"] = None
-                            df["liquidity"] = None
-                        df["volume"] = df["volume_24hr"]
-                        print(f"Calculated volume for {len(df):,} markets from trades")
-                    else:
-                        print("No usd_amount column in trades or trades are empty")
-                        db.close()
-                        return
-                else:
-                    print(f"Parquet trades directory not available: {parquet_trades_dir}")
-                    db.close()
-                    return
-            except Exception as e:
-                print(f"Error loading trades: {e}")
+                db = PredictionMarketDB(db_path)
+                query = """
+                    SELECT id, slug, question, volume_24hr, volume, liquidity
+                    FROM polymarket_markets
+                    WHERE volume_24hr IS NOT NULL AND volume_24hr > 0
+                    ORDER BY volume_24hr DESC
+                """
+                df = db.query(query)
+                if df.empty:
+                    query2 = """
+                        SELECT id, slug, question, volume as volume_24hr, volume, liquidity
+                        FROM polymarket_markets
+                        WHERE volume IS NOT NULL AND volume > 0
+                        ORDER BY volume DESC
+                    """
+                    df = db.query(query2)
                 db.close()
-                return
+                if not df.empty:
+                    print(f"Found {len(df):,} markets from database")
+            except Exception as e:
+                print(f"Database load failed: {e}")
+                if df is None:
+                    df = pd.DataFrame()
+        if (df is None or df.empty) and use_db:
+            try:
+                db = PredictionMarketDB(db_path)
+                trades_query = """
+                    SELECT market_id, SUM(usd_amount) as volume_24hr, COUNT(*) as trade_count
+                    FROM polymarket_trades
+                    WHERE usd_amount IS NOT NULL AND usd_amount > 0
+                    GROUP BY market_id ORDER BY volume_24hr DESC
+                """
+                volume_df = db.query(trades_query)
+                if not volume_df.empty:
+                    markets_df = db.query("SELECT id, slug, question, liquidity FROM polymarket_markets")
+                    db.close()
+                    df = volume_df.merge(markets_df, left_on="market_id", right_on="id", how="left") if not markets_df.empty else volume_df.copy()
+                    if "id" not in df.columns:
+                        df["id"] = df["market_id"]
+                    if "volume" not in df.columns:
+                        df["volume"] = df["volume_24hr"]
+                    if "slug" not in df.columns:
+                        df["slug"] = None
+                    if "question" not in df.columns:
+                        df["question"] = None
+                    if "liquidity" not in df.columns:
+                        df["liquidity"] = None
+                    print(f"Found {len(df):,} markets from database trades")
+                else:
+                    db.close()
+            except Exception as e:
+                print(f"Database trades failed: {e}")
+                if df is None:
+                    df = pd.DataFrame()
     
-    if df.empty:
+    if df is None or df.empty:
         print("No volume data found from any source.")
         return
     
@@ -440,7 +411,7 @@ def analyze_volume_distribution(
     return df, total_volume, gini, hhi, alpha, skewness, kurtosis, bucket_counts, bucket_volumes, buckets
 
 
-def create_volume_visualizations(
+def create_volume_visualizations_extra(
     df: pd.DataFrame,
     total_volume: float,
     gini: float,
@@ -449,9 +420,9 @@ def create_volume_visualizations(
     buckets: list,
     output_dir: Path = None,
 ):
-    """Create and save visualization charts."""
+    """Create and save standalone charts: histogram, pareto, buckets, top markets."""
     if output_dir is None:
-        output_dir = Path("data/output")
+        output_dir = Path("data/research")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Set style
@@ -610,15 +581,19 @@ def create_volume_visualizations(
     df: pd.DataFrame,
     total_volume: float,
     gini: float,
+    hhi: float,
+    alpha: Optional[float],
+    skewness: float,
+    kurtosis: float,
     bucket_counts: list,
     bucket_volumes: list,
     buckets: list,
     output_dir: Path = None,
 ):
-    """Create and save visualization charts of volume distribution."""
+    """Create and save 4-panel dashboard and power-law chart."""
     
     if output_dir is None:
-        output_dir = Path("data/output")
+        output_dir = Path("data/research")
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
@@ -674,7 +649,8 @@ def create_volume_visualizations(
     colors = plt.cm.viridis(np.linspace(0, 1, len(top_30)))
     bars = ax3.barh(range(len(top_30)), top_30["volume_24hr"].values / 1e6, color=colors)
     ax3.set_yticks(range(len(top_30)))
-    ax3.set_yticklabels([f"Market {int(mid)}" for mid in top_30["market_id"].values], fontsize=8)
+    mid_col = "market_id" if "market_id" in top_30.columns else "id"
+    ax3.set_yticklabels([f"Market {mid}" for mid in top_30[mid_col].astype(str).values], fontsize=8)
     ax3.set_xlabel('Volume (Millions USD)', fontsize=11)
     ax3.set_title('Top 30 Markets by Volume', fontsize=12, fontweight='bold')
     ax3.grid(True, alpha=0.3, axis='x')
@@ -761,10 +737,12 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Analyze volume distribution across markets")
-    parser.add_argument("--db-path", default="data/prediction_markets.db", help="Path to database")
-    parser.add_argument("--use-trades", action="store_true", help="Calculate volume from trades instead of market metadata")
+    parser.add_argument("--db-path", default="data/prediction_markets.db", help="Path to database (only used with --use-db)")
+    parser.add_argument("--use-trades", action="store_true", help="Prefer volume from parquet trades if no parquet markets")
     parser.add_argument("--parquet-trades-dir", default="data/polymarket/trades", help="Path to parquet trades directory")
-    parser.add_argument("--output-dir", default="data/output", help="Directory to save PNG visualizations")
+    parser.add_argument("--parquet-markets-dir", default="data/polymarket", help="Path to parquet markets (default; used first)")
+    parser.add_argument("--use-db", action="store_true", help="Use database (default is parquet only)")
+    parser.add_argument("--output-dir", default="data/research", help="Directory to save PNG visualizations")
     parser.add_argument("--no-viz", action="store_true", help="Skip creating visualizations")
     
     args = parser.parse_args()
@@ -772,14 +750,19 @@ if __name__ == "__main__":
         db_path=args.db_path,
         use_trades=args.use_trades,
         parquet_trades_dir=args.parquet_trades_dir,
+        parquet_markets_dir=args.parquet_markets_dir,
+        use_db=args.use_db,
     )
     
     if result and not args.no_viz:
         df, total_volume, gini, hhi, alpha, skewness, kurtosis, bucket_counts, bucket_volumes, buckets = result
         print("\nGenerating visualizations...")
+        out = Path(args.output_dir)
+        create_volume_visualizations_extra(
+            df, total_volume, gini, bucket_counts, bucket_volumes, buckets, output_dir=out
+        )
         create_volume_visualizations(
             df, total_volume, gini, hhi, alpha, skewness, kurtosis,
             bucket_counts, bucket_volumes, buckets,
-            output_dir=Path(args.output_dir)
+            output_dir=out
         )
-

@@ -692,7 +692,7 @@ def save_diagnostics_csv(
 
 def generate_all_reports(
     results: dict,
-    output_dir: str = "data/output/html_reports",
+    output_dir: str = "data/research/html_reports",
     run_type: str = "backtest",
 ) -> None:
     """

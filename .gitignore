@@ -1,4 +1,5 @@
 .claude
+.cursor
 venv
 
 .env
@@ -13,8 +14,11 @@ SOUL.md
 USER.md
 TOOLS.md
 MEMORY.md
+PROJECT_STATUS.md
+STRATEGIC_ROADMAP.md
+memory/
 
-docs/
+htmlcov
 
 # Caching
 __pycache__/
@@ -22,11 +26,5 @@ __pycache__/
 .pytest_cache/
 
 # Data
-data/arb/
-data/polymarket/
-data/kalshi/
-data/output/
-data/parquet/
-data/polymarket_clob/
-prediction_markets.db
-prediction_markets_sample.db
+data/
+

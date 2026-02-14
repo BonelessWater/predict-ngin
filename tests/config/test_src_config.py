@@ -210,8 +210,8 @@ def test_deep_merge_overwrite_nested():
 def test_database_settings_defaults():
     """Test DatabaseSettings with defaults."""
     settings = DatabaseSettings()
-    assert settings.path == "data/prediction_markets.db"
-    assert settings.backup_enabled is True
+    assert settings.path == "data/research"
+    assert settings.backup_enabled is False
     assert settings.backup_interval_hours == 24
 
 
@@ -290,7 +290,7 @@ def test_populate_dataclass_empty():
     """Test populating dataclass with empty dict."""
     result = _populate_dataclass(DatabaseSettings, {})
     assert isinstance(result, DatabaseSettings)
-    assert result.path == "data/prediction_markets.db"  # default
+    assert result.path == "data/research"  # default
 
 
 def test_populate_dataclass_partial():

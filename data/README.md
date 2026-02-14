@@ -1,90 +1,40 @@
-# Prediction Market Data
+# Data Directory
 
-This directory contains prediction market data consolidated into a SQLite database.
+**Canonical data source:** `data/research`
 
-## Data Sources
+All analysis and research use data from `data/research`. Database generation (`prediction_markets.db`) is deprecated.
 
-| Source | Records | Description |
-|--------|---------|-------------|
-| **Manifold Markets** | ~174K markets | Play-money prediction market |
-| **Polymarket** | ~2K markets | USDC prediction market |
-| **Polymarket Prices** | ~279M price points | Historical CLOB price data |
-| **Polymarket Trades** | ~5.6M trades | Trade history |
-
-## Directory Structure
+## Layout
 
 ```
 data/
-|-- prediction_markets.db    # SQLite database (32 GB)
-|-- output/                   # Analysis outputs (CSV, HTML reports)
-`-- poly_data/                # (Optional) Raw Polymarket trade data
+└── research/                    # Canonical research data
+    ├── {category}/              # e.g. Tech, Politics, Finance
+    │   ├── markets_filtered.csv
+    │   ├── trades.parquet
+    │   └── prices.parquet
+    ├── users/
+    │   ├── user_activity_summary.json
+    │   ├── user_stats.csv
+    │   └── activity_*.json
+    ├── user_research/           # User behavior analysis outputs
+    ├── user_profiles/           # Per-user profile summaries
+    ├── features/                # Market features (extract_market_features)
+    ├── similarities/           # Market similarities
+    ├── correlations/            # Price correlations
+    └── checkpoints/             # Research script checkpoints
 ```
 
-## Database Schema
+## Populating data/research
 
-### Tables
+1. **Market list:** Place `Polymarket/{Category}/markets.csv` at repo root.
+2. **Filter to top 500:** `python scripts/data/collect_research_by_market_list.py --top-n 500 --markets-only`
+3. **Fetch trades and prices:** `python scripts/data/fetch_research_trades_and_prices.py --research-dir data/research`
+4. **User activity:** `python scripts/data/fetch_user_activity_summary.py --output-dir data/research/users`
 
-| Table | Description |
-|-------|-------------|
-| `manifold_markets` | Manifold market metadata (JSON blob) |
-| `manifold_bets` | Manifold bet/trade records |
-| `polymarket_markets` | Polymarket market metadata |
-| `polymarket_prices` | CLOB price history |
-| `polymarket_trades` | Processed trade records |
+See `data/research/README.md` for full details.
 
-### Usage Examples
+## Deprecated
 
-```python
-from src.whale_strategy import load_markets, load_polymarket_markets
-
-# Load Manifold markets (from database)
-markets = load_markets()
-print(f"Loaded {len(markets):,} Manifold markets")
-
-# Load Polymarket markets (from database)
-poly_markets = load_polymarket_markets()
-print(f"Loaded {len(poly_markets):,} Polymarket markets")
-```
-
-### Direct SQL Queries
-
-```python
-from src.whale_strategy import PredictionMarketDB
-
-db = PredictionMarketDB()
-
-# Get all Polymarket markets
-markets_df = db.get_all_markets()
-
-# Get price history for a market
-prices_df = db.get_price_history(market_id="12345", outcome="YES")
-
-# Find significant price movements
-changes_df = db.get_price_changes(min_change=0.05, time_window_minutes=60)
-
-# Custom SQL query
-df = db.query("SELECT COUNT(*) FROM polymarket_trades WHERE price > 0.9")
-
-db.close()
-```
-
-## Rebuilding the Database
-
-If you need to rebuild from source JSON files:
-
-```bash
-python run.py --build-db
-```
-
-## APIs Used (Free, No Auth Required)
-
-| Platform | Endpoint | Description |
-|----------|----------|-------------|
-| Manifold | `api.manifold.markets/v0/markets` | Market metadata |
-| Manifold | `api.manifold.markets/v0/bets` | Trade/bet history |
-| Polymarket Gamma | `gamma-api.polymarket.com/markets` | Market metadata |
-| Polymarket CLOB | `clob.polymarket.com/prices-history` | Price history |
-
-## Data Collection Date
-
-Data collected: January 31, 2026
+- `prediction_markets.db` — Do not generate. Use parquet in `data/research` instead.
+- `data/polymarket/`, `data/parquet/` — Legacy paths. All data lives in `data/research`.

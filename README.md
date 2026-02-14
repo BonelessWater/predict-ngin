@@ -78,56 +78,36 @@ Data is stored in Parquet format (columnar storage) for efficient querying and a
 
 ```
 data/
-|-- parquet/
-|   |-- prices/          # Price history (prices_YYYY-MM.parquet)
-|   |-- markets/         # Market metadata (markets_*.parquet)
-|   `-- trades/          # Trade history (trades_YYYY-MM_part*.parquet)
-`-- output/              # Generated reports
+`-- research/            # Canonical data (ONLY source)
+    ├── {category}/      # Tech, Politics, etc.
+    │   ├── markets_filtered.csv
+    │   ├── trades.parquet
+    │   └── prices.parquet
+    ├── users/            # User activity
+    └── user_research/    # Analysis outputs
 ```
 
 ### Data Loading
 
 ```python
-from src.trading.data_modules.parquet_store import PriceStore, TradeStore
-from src.trading.data_modules.data import load_markets
+import pandas as pd
+from pathlib import Path
 
-# Load markets
-markets = load_markets()  # Loads from parquet or JSON fallback
-
-# Load price data
-price_store = PriceStore(base_dir="data/parquet/prices")
-prices_df = price_store.load_prices(
-    market_ids=["market_id_1", "market_id_2"],
-    start_date="2024-01-01",
-    end_date="2024-12-31"
-)
-
-# Load trade data
-trade_store = TradeStore(base_dir="data/parquet/trades")
-trades_df = trade_store.load_trades(
-    start_date="2024-01-01",
-    end_date="2024-12-31"
-)
+# Load trades from data/research
+trades = pd.read_parquet("data/research/Tech/trades.parquet")
 ```
 
-### Optional: SQLite Database
+### Data: data/research (canonical)
 
-An optional SQLite database can be built from parquet files for SQL queries:
+All data lives in `data/research`. Database generation is deprecated.
 
 ```bash
-# Build database from parquet files (optional)
-python run.py --build-db
+# Populate data/research
+python scripts/data/collect_research_by_market_list.py --top-n 500 --markets-only
+python scripts/data/fetch_research_trades_and_prices.py --research-dir data/research
 ```
 
-```python
-from src.trading.data_modules.database import PredictionMarketDB
-
-# Use database for SQL queries (if built)
-db = PredictionMarketDB()
-df = db.query("SELECT * FROM polymarket_trades WHERE usd_amount > 1000")
-prices = db.get_price_history("market_id", outcome="YES")
-db.close()
-```
+See `data/research/README.md` for full workflow.
 
 ## Whale Strategies
 
@@ -169,13 +149,13 @@ print(f"Generated {len(signals)} signals")
 
 ## Whale Identification Methods
 
-| Method | Description | Best For |
-|--------|-------------|----------|
-| `volume_top10` | Top 10 by total volume | Conservative |
-| `volume_pct95` | 95th percentile volume | Balanced |
-| `large_trades` | Avg trade > $1000 | Large traders |
-| `win_rate_60pct` | 60%+ win rate | **Best accuracy** |
-| `combo_vol_win` | High volume + good win rate | Quality filter |
+| Method           | Description                 | Best For          |
+| ---------------- | --------------------------- | ----------------- |
+| `volume_top10`   | Top 10 by total volume      | Conservative      |
+| `volume_pct95`   | 95th percentile volume      | Balanced          |
+| `large_trades`   | Avg trade > $1000           | Large traders     |
+| `win_rate_60pct` | 60%+ win rate               | **Best accuracy** |
+| `combo_vol_win`  | High volume + good win rate | Quality filter    |
 
 ## Data Fetching
 
@@ -225,7 +205,7 @@ python -m src.tools.market_scanner --mode opportunities --mode expiring --top 15
 
 This uses the Polymarket market WebSocket and flags large last-trade events.
 The market channel does not include trader addresses, so "whale" means large
-notional size based on price * size.
+notional size based on price \* size.
 
 Set these environment variables (or put them in `.env`):
 
@@ -314,11 +294,11 @@ Total Cost = Spread + Slippage + Market Impact
 Impact = coefficient * sqrt(trade_size / liquidity)
 ```
 
-| Size | Spread | Slippage | Min Liquidity |
-|------|--------|----------|---------------|
-| Small ($100-500) | 2.0% | 0.5% | $500 |
-| Medium ($1k-5k) | 2.5% | 1.0% | $5,000 |
-| Large ($10k+) | 3.0% | 2.0% | $25,000 |
+| Size             | Spread | Slippage | Min Liquidity |
+| ---------------- | ------ | -------- | ------------- |
+| Small ($100-500) | 2.0%   | 0.5%     | $500          |
+| Medium ($1k-5k)  | 2.5%   | 1.0%     | $5,000        |
+| Large ($10k+)    | 3.0%   | 2.0%     | $25,000       |
 
 ## CLI Reference
 
@@ -341,17 +321,17 @@ python run.py --polymarket-whales
 
 ### Manifold Markets (5M bets, 174K markets)
 
-| Method | Whales | Win Rate | Sharpe |
-|--------|--------|----------|--------|
-| win_rate_60pct | 583 | 69.8% | 2.4 |
-| volume_pct95 | 545 | 68.5% | 2.1 |
-| combo_vol_win | 312 | 71.4% | 2.6 |
+| Method         | Whales | Win Rate | Sharpe |
+| -------------- | ------ | -------- | ------ |
+| win_rate_60pct | 583    | 69.8%    | 2.4    |
+| volume_pct95   | 545    | 68.5%    | 2.1    |
+| combo_vol_win  | 312    | 71.4%    | 2.6    |
 
 ### Polymarket (5.6M trades, 102K traders)
 
-| Metric | Value |
-|--------|-------|
-| Whales (60%+ WR) | 1,423 |
+| Metric             | Value |
+| ------------------ | ----- |
+| Whales (60%+ WR)   | 1,423 |
 | Avg Whale Win Rate | 77.8% |
 | Total Whale Volume | $187M |
 

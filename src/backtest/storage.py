@@ -177,7 +177,33 @@ def save_backtest_result(
     log.info(f"Saving backtest result: {run_id}")
     
     # Extract metrics and data
-    if hasattr(result, "summary"):
+    if isinstance(result, dict):
+        # Whale backtest and similar dict-based results
+        trades_df = result.get("trades_df")
+        daily_returns = result.get("daily_returns")
+        summary = None
+        if trades_df is not None and not trades_df.empty:
+            try:
+                from ..trading.reporting import (
+                    RunMetadata,
+                    RunMetrics,
+                    RunDiagnostics,
+                    RunSummary,
+                )
+                metrics = RunMetrics(
+                    total_trades=result.get("total_trades", 0),
+                    win_rate=result.get("win_rate", 0.0),
+                    total_net_pnl=result.get("total_net_pnl", 0.0),
+                    roi_pct=result.get("roi_pct", 0.0),
+                )
+                summary = RunSummary(
+                    metadata=RunMetadata(strategy_name=strategy_name),
+                    metrics=metrics,
+                    diagnostics=RunDiagnostics(),
+                )
+            except Exception:
+                summary = None
+    elif hasattr(result, "summary"):
         # PolymarketBacktestResult or similar
         summary = result.summary
         trades_df = result.trades_df
@@ -309,14 +335,21 @@ def save_backtest_result(
 def _extract_parameters(result: Any) -> Dict[str, Any]:
     """Extract parameters from result object."""
     params = {}
-    
+
+    # Dict-based result (e.g. whale backtest)
+    if isinstance(result, dict):
+        for attr in ["capital", "min_usd", "train_ratio", "whales_followed", "categories"]:
+            if attr in result and result[attr] is not None:
+                params[attr] = result[attr]
+        return params
+
     # Try common attributes
     for attr in ["position_size", "starting_capital", "threshold", "config"]:
         if hasattr(result, attr):
             value = getattr(result, attr)
             if value is not None:
                 params[attr] = value
-    
+
     # Try summary.metadata
     if hasattr(result, "summary") and hasattr(result.summary, "metadata"):
         meta = result.summary.metadata
@@ -325,7 +358,7 @@ def _extract_parameters(result: Any) -> Dict[str, Any]:
                 value = getattr(meta, attr)
                 if value is not None:
                     params[attr] = value
-    
+
     return params
 
 

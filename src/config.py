@@ -98,10 +98,10 @@ class ConfigNamespace:
 
 @dataclass
 class DatabaseSettings:
-    path: str = "data/prediction_markets.db"
-    polymarket_trades_path: str = "data/poly_data/processed/trades.csv"
-    parquet_dir: str = "data/polymarket"
-    backup_enabled: bool = True
+    path: str = "data/research"  # Legacy; DB deprecated
+    polymarket_trades_path: str = "data/research"
+    parquet_dir: str = "data/research"
+    backup_enabled: bool = False
     backup_interval_hours: int = 24
 
 
@@ -110,7 +110,7 @@ class PolymarketDataSettings:
     gamma_api: str = "https://gamma-api.polymarket.com"
     clob_api: str = "https://clob.polymarket.com"
     ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    data_dir: str = "data/polymarket"
+    data_dir: str = "data/research"
     min_volume_24h: int = 1000
     max_markets: int = 500
     request_delay: float = 0.1
@@ -183,7 +183,7 @@ class BacktestSettings:
     max_holding_seconds: int = 172800
     default_position_size: int = 250
     position_sizes_to_test: List[int] = field(default_factory=lambda: [100, 250, 500, 1000, 2500, 5000, 10000])
-    output_dir: str = "data/output"
+    output_dir: str = "data/research"
     generate_html_report: bool = True
 
 

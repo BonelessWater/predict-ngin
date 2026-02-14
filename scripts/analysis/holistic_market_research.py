@@ -41,54 +41,94 @@ def load_market_data(
     db_path: str = "data/prediction_markets.db",
     use_trades: bool = True,
     parquet_trades_dir: str = "data/polymarket/trades",
+    parquet_markets_dir: Optional[str] = "data/polymarket",
+    use_db: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load market metadata and calculate volume from trades."""
+    """Load market metadata and volume. Uses parquet by default (no DB)."""
     
     print("Loading market data...")
-    db = PredictionMarketDB(db_path)
+    markets_df = pd.DataFrame()
     
-    # Load market metadata
-    markets_query = """
-        SELECT 
-            id,
-            slug,
-            question,
-            volume,
-            volume_24hr,
-            liquidity,
-            end_date,
-            outcomes,
-            outcome_prices,
-            created_at
-        FROM polymarket_markets
-    """
+    # 1. Use DB only when explicitly requested
+    if use_db:
+        try:
+            db = PredictionMarketDB(db_path)
+            markets_query = """
+                SELECT id, slug, question, volume, volume_24hr, liquidity,
+                       end_date, outcomes, outcome_prices, created_at
+                FROM polymarket_markets
+            """
+            markets_df = db.query(markets_query)
+            db.close()
+            if not markets_df.empty:
+                print(f"  Loaded {len(markets_df):,} markets from database")
+        except Exception as e:
+            print(f"  Database load failed: {e}")
     
-    markets_df = db.query(markets_query)
-    db.close()
+    # 2. Parquet markets first (default: all data in parquets)
+    if len(markets_df) == 0 and parquet_markets_dir:
+        pm_path = Path(parquet_markets_dir)
+        if pm_path.exists():
+            single = pm_path / "markets.parquet"
+            markets_files = [single] if single.exists() else list(pm_path.glob("markets_*.parquet"))
+            if markets_files:
+                print("  Trying parquet markets...")
+                try:
+                    markets_list = [pd.read_parquet(f) for f in markets_files]
+                    markets_df = pd.concat(markets_list, ignore_index=True)
+                    if "id" not in markets_df.columns and "ID" in markets_df.columns:
+                        markets_df["id"] = markets_df["ID"]
+                    markets_df["id"] = markets_df["id"].astype(str)
+                    if "volume24hr" in markets_df.columns:
+                        markets_df["volume_24hr"] = markets_df["volume24hr"]
+                    if "volume_24hr" not in markets_df.columns:
+                        markets_df["volume_24hr"] = 0
+                    if "volume" not in markets_df.columns:
+                        markets_df["volume"] = markets_df["volume_24hr"].fillna(0)
+                    if "liquidity" not in markets_df.columns:
+                        markets_df["liquidity"] = 0
+                    print(f"  Loaded {len(markets_df):,} markets from parquet")
+                except Exception as e:
+                    print(f"  Error loading parquet markets: {e}")
     
-    print(f"  Loaded {len(markets_df):,} markets from database")
-    
-    # Try to load market index JSON if database is empty
+    # 3. Market index JSON fallback when parquet had no markets
     if len(markets_df) == 0:
-        print("  Database empty, checking for market_index.json...")
-        market_index_path = Path("data/polymarket/market_index.json")
+        market_index_path = Path(parquet_markets_dir or "data/polymarket") / "market_index.json"
         if market_index_path.exists():
-            print(f"  Found market index at {market_index_path}")
+            print("  Trying market_index.json...")
             try:
-                import json
-                with open(market_index_path, 'r') as f:
+                with open(market_index_path, "r") as f:
                     market_index = json.load(f)
                 if market_index:
                     markets_df = pd.DataFrame(market_index)
                     markets_df["id"] = markets_df["id"].astype(str)
-                    # Rename volume24hr to volume_24hr for consistency
                     if "volume24hr" in markets_df.columns:
                         markets_df["volume_24hr"] = markets_df["volume24hr"]
+                    if "volume_24hr" not in markets_df.columns:
+                        markets_df["volume_24hr"] = 0
+                    if "volume" not in markets_df.columns:
+                        markets_df["volume"] = markets_df["volume_24hr"].fillna(0)
+                    if "liquidity" not in markets_df.columns:
+                        markets_df["liquidity"] = 0
                     print(f"  Loaded {len(markets_df):,} markets from index file")
             except Exception as e:
                 print(f"  Error loading market index: {e}")
     
+    # 4. DB fallback only when requested and still no data
+    if len(markets_df) == 0 and use_db:
+        print("  Trying database again...")
+        try:
+            db = PredictionMarketDB(db_path)
+            markets_df = db.query("SELECT id, slug, question, volume, volume_24hr, liquidity, end_date, outcomes, outcome_prices, created_at FROM polymarket_markets")
+            db.close()
+            if not markets_df.empty:
+                print(f"  Loaded {len(markets_df):,} markets from database")
+        except Exception as e:
+            print(f"  Database fallback failed: {e}")
+    
     # Calculate volume from trades if requested
+    # Note: Parquet markets and trades use different ID schemes, so we don't merge them.
+    # Instead: use parquet markets if they have volume, otherwise create markets from trades.
     if use_trades:
         print("Calculating volume from trades...")
         try:
@@ -104,35 +144,26 @@ def load_market_data(
                     })
                     volume_df.columns = ["volume_from_trades", "trade_count", "avg_trade_size"]
                     volume_df = volume_df.reset_index()
-                    
-                    # Merge with markets
-                    markets_df = markets_df.merge(
-                        volume_df,
-                        left_on="id",
-                        right_on="market_id",
-                        how="left"
-                    )
-                    markets_df["volume_from_trades"] = markets_df["volume_from_trades"].fillna(0)
-                    markets_df["trade_count"] = markets_df["trade_count"].fillna(0)
-                    markets_df["avg_trade_size"] = markets_df["avg_trade_size"].fillna(0)
-                    
-                    # Use trade volume if available, otherwise use metadata volume
-                    markets_df["final_volume"] = markets_df["volume_from_trades"].fillna(
-                        markets_df["volume_24hr"].fillna(markets_df["volume"])
-                    )
+                    volume_df["market_id"] = volume_df["market_id"].astype(str)
                     
                     print(f"  Calculated volume for {len(volume_df):,} markets from trades")
                     
-                    # If markets_df is empty, try to fetch metadata from API
-                    if len(markets_df) == 0:
-                        print("  No markets in database, creating from trades...")
+                    # Check if parquet markets have volume
+                    has_volume_in_markets = False
+                    if len(markets_df) > 0:
+                        vol_col = markets_df.get("volume_24hr", markets_df.get("volume", pd.Series()))
+                        has_volume_in_markets = (vol_col.fillna(0) > 0).any() if len(vol_col) > 0 else False
+                    
+                    # If markets_df is empty OR has no volume, create from trades
+                    if len(markets_df) == 0 or not has_volume_in_markets:
+                        if len(markets_df) > 0:
+                            print("  Parquet markets have no volume, using trades instead...")
+                        else:
+                            print("  No markets found, creating from trades...")
                         print("  NOTE: Market metadata (questions/slugs) not available in trades.")
-                        print("  To get proper categorization, either:")
-                        print("    1. Fetch price data (creates market_index.json with questions)")
-                        print("    2. Populate database with market metadata")
-                        print("    3. Markets will be marked as 'uncategorized'")
+                        print("  Markets will be marked as 'uncategorized'")
                         
-                        # Create markets from volume_df (no metadata available)
+                        # Create markets from volume_df
                         markets_df = volume_df.copy()
                         markets_df["id"] = markets_df["market_id"]
                         markets_df["question"] = "Market " + markets_df["market_id"].astype(str)
@@ -144,24 +175,14 @@ def load_market_data(
                         markets_df["outcomes"] = None
                         markets_df["outcome_prices"] = None
                         markets_df["created_at"] = None
-                        
-                        # Set final_volume from trades
-                        if "final_volume" not in markets_df.columns:
-                            markets_df["final_volume"] = markets_df["volume_from_trades"]
+                        markets_df["final_volume"] = markets_df["volume_from_trades"]
                     else:
-                        # Merge with existing markets
-                        markets_df = markets_df.merge(
-                            volume_df,
-                            left_on="id",
-                            right_on="market_id",
-                            how="left"
-                        )
-                        markets_df["volume_from_trades"] = markets_df["volume_from_trades"].fillna(0)
-                        markets_df["trade_count"] = markets_df["trade_count"].fillna(0)
-                        markets_df["avg_trade_size"] = markets_df["avg_trade_size"].fillna(0)
-                        markets_df["final_volume"] = markets_df["volume_from_trades"].fillna(
-                            markets_df["volume_24hr"].fillna(markets_df["volume"])
-                        )
+                        # Parquet markets have volume, use that (don't merge - IDs don't match)
+                        print("  Parquet markets have volume, using that (not merging with trades - IDs don't match)")
+                        markets_df["volume_from_trades"] = 0
+                        markets_df["trade_count"] = 0
+                        markets_df["avg_trade_size"] = 0
+                        markets_df["final_volume"] = markets_df["volume_24hr"].fillna(markets_df["volume"]).fillna(0)
                 else:
                     # No usd_amount column or empty trades
                     if len(markets_df) > 0:
@@ -192,15 +213,26 @@ def load_market_data(
         markets_df["trade_count"] = 0
         markets_df["avg_trade_size"] = 0
     
-    # Parse JSON columns
+    # Parse JSON columns (handle invalid JSON gracefully)
+    def safe_json_loads(x):
+        if pd.isna(x) or x is None:
+            return []
+        if isinstance(x, list):
+            return x
+        if isinstance(x, str):
+            x = x.strip()
+            if not x or x in ["null", "None", "[]", "{}"]:
+                return []
+            try:
+                return json.loads(x)
+            except (json.JSONDecodeError, ValueError):
+                return []
+        return []
+    
     if "outcomes" in markets_df.columns:
-        markets_df["outcomes"] = markets_df["outcomes"].apply(
-            lambda x: json.loads(x) if isinstance(x, str) else (x if isinstance(x, list) else [])
-        )
+        markets_df["outcomes"] = markets_df["outcomes"].apply(safe_json_loads)
     if "outcome_prices" in markets_df.columns:
-        markets_df["outcome_prices"] = markets_df["outcome_prices"].apply(
-            lambda x: json.loads(x) if isinstance(x, str) else (x if isinstance(x, list) else [])
-        )
+        markets_df["outcome_prices"] = markets_df["outcome_prices"].apply(safe_json_loads)
     
     # Calculate market age
     now = pd.Timestamp.now()
@@ -211,6 +243,12 @@ def load_market_data(
         markets_df["market_age_days"] = (now - markets_df["created_at"]).dt.total_seconds() / 86400
     else:
         markets_df["market_age_days"] = np.nan
+    
+    # Ensure final_volume exists before any derived columns (handles market_index.json, missing volume, etc.)
+    if "final_volume" not in markets_df.columns:
+        v24 = markets_df["volume_24hr"] if "volume_24hr" in markets_df.columns else pd.Series(0.0, index=markets_df.index)
+        v = markets_df["volume"] if "volume" in markets_df.columns else pd.Series(0.0, index=markets_df.index)
+        markets_df["final_volume"] = v24.fillna(v).fillna(0)
     
     # Parse end dates
     if "end_date" in markets_df.columns:
@@ -229,10 +267,6 @@ def load_market_data(
     
     # Calculate volume-to-liquidity ratio
     markets_df["volume_liquidity_ratio"] = markets_df["final_volume"] / markets_df["liquidity"].replace(0, np.nan)
-    
-    # Ensure final_volume exists
-    if "final_volume" not in markets_df.columns:
-        markets_df["final_volume"] = markets_df.get("volume_24hr", markets_df.get("volume", 0))
     
     # Filter out markets with no volume
     markets_df = markets_df[markets_df["final_volume"] > 0].copy()
@@ -860,21 +894,28 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Comprehensive holistic market research")
-    parser.add_argument("--db-path", default="data/prediction_markets.db", help="Path to database")
-    parser.add_argument("--use-trades", action="store_true", help="Calculate volume from trades")
+    parser.add_argument("--db-path", default="data/prediction_markets.db", help="Path to database (only used with --use-db)")
+    parser.add_argument("--use-trades", action="store_true", help="Merge volume from parquet trades")
+    parser.add_argument("--no-trades", action="store_true", help="Do not load trades (use market volume only; default when parquet markets exist)")
     parser.add_argument("--parquet-trades-dir", default="data/polymarket/trades", help="Parquet trades directory")
+    parser.add_argument("--parquet-markets-dir", default="data/polymarket", help="Directory for markets.parquet (default; used first)")
+    parser.add_argument("--use-db", action="store_true", help="Use database (default is parquet only)")
     parser.add_argument("--output-dir", default="docs/results/holistic_research", help="Output directory")
     
     args = parser.parse_args()
+    # Default: use parquet trades unless --no-trades
+    use_trades = not args.no_trades
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load data
+    # Load data (parquet by default, no DB)
     markets_df, trades_df = load_market_data(
         db_path=args.db_path,
-        use_trades=args.use_trades,
+        use_trades=use_trades,
         parquet_trades_dir=args.parquet_trades_dir,
+        parquet_markets_dir=args.parquet_markets_dir,
+        use_db=args.use_db,
     )
     
     if len(markets_df) == 0:

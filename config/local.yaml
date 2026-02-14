@@ -15,7 +15,7 @@ data:
     gamma_api: "https://gamma-api.polymarket.com"
     clob_api: "https://clob.polymarket.com"
     ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    data_dir: "data/polymarket"
+    data_dir: "data/research"
 
     # Fetching
     min_volume_24h: 1000
@@ -202,7 +202,7 @@ backtest:
   position_sizes_to_test: [10, 25, 50, 100, 250, 500, 1000]
 
   # Reporting
-  output_dir: "data/output"
+  output_dir: "data/research"
   generate_html_report: true
 
 # =============================================================================
@@ -293,7 +293,7 @@ logging:
 # RESEARCH
 # =============================================================================
 research:
-  output_dir: "data/research_reports"
+  output_dir: "data/research"
 
   # Whale features
   whale_features:

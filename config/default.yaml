@@ -1,26 +1,27 @@
 # Predict-Ngin Configuration
-# Copy to config/local.yaml and customize
+# Override in config/local.yaml for your environment
 
 # =============================================================================
-# DATABASE
+# DATA (canonical: data/research)
 # =============================================================================
+# All data defaults to data/research. DB generation is deprecated.
 database:
-  path: "data/prediction_markets.db"
-  polymarket_trades_path: "data/poly_data/processed/trades.csv"
-  parquet_dir: "data/parquet"
-  backup_enabled: true
+  path: "data/research" # Legacy; DB deprecated. Use parquet in data/research.
+  polymarket_trades_path: "data/research"
+  parquet_dir: "data/research"
+  backup_enabled: false
   backup_interval_hours: 24
 
 # =============================================================================
 # DATA COLLECTION
 # =============================================================================
 data:
-  # Polymarket
+  # Polymarket (fetched data written here; research uses data/research)
   polymarket:
     gamma_api: "https://gamma-api.polymarket.com"
     clob_api: "https://clob.polymarket.com"
     ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    data_dir: "data/polymarket"
+    data_dir: "data/research"
 
     # Fetching
     min_volume_24h: 1000
@@ -32,7 +33,7 @@ data:
   kalshi:
     api_url: "https://api.elections.kalshi.com/trade-api/v2"
     data_dir: "data/kalshi"
-    min_volume: 0  # Minimum volume to fetch trades
+    min_volume: 0 # Minimum volume to fetch trades
     request_delay: 0.1
 
   # Manifold
@@ -47,6 +48,26 @@ data:
 whale_strategy:
   # Identification method
   method: "win_rate_60pct" # Options: volume_top10, volume_pct95, large_trades, win_rate_60pct, combo_vol_win, profit_proxy
+
+  # Whale mode (shared by backtest + find_whale_opportunities)
+  #  - volume_only: 95th percentile volume in market (rolling)
+  #  - surprise_only: volume whales with positive surprise (requires resolutions)
+  #  - default: identify_polymarket_whales (mid_price_accuracy or volume_top10)
+  whale_mode: "volume_only"
+
+  # Volume-only mode: percentile threshold
+  volume_percentile: 95.0
+
+  # Unfavored filter: only underdog trades (BUY <=40c, SELL >=60c)
+  unfavored_only: false
+  unfavored_max_price: 0.40
+
+  # Performance filter: only follow whales with WR >= 50% and positive surprise
+  min_whale_wr: 0.50
+  require_positive_surprise: true
+
+  # Min trade size (USD) to count
+  min_usd: 100.0
 
   # Filters
   min_trades: 20
@@ -131,15 +152,15 @@ strategies:
 
   # Cross-Platform Arbitrage (Polymarket vs Kalshi)
   arbitrage:
-    enabled: false  # Experimental
-    entry_spread: 0.05  # Minimum spread to enter (5 cents)
-    exit_spread: 0.01   # Close when spread narrows to this
-    min_expected_profit: 0.02  # Minimum profit after fees
+    enabled: false # Experimental
+    entry_spread: 0.05 # Minimum spread to enter (5 cents)
+    exit_spread: 0.01 # Close when spread narrows to this
+    min_expected_profit: 0.02 # Minimum profit after fees
     z_score_threshold: 1.5
-    lookback_periods: 30  # Rolling window for spread stats
-    max_holding_periods: null  # No forced exit by default
-    min_match_confidence: 0.40  # Minimum market match score
-    resample_freq: "1D"  # Daily spread sampling
+    lookback_periods: 30 # Rolling window for spread stats
+    max_holding_periods: null # No forced exit by default
+    min_match_confidence: 0.40 # Minimum market match score
+    resample_freq: "1D" # Daily spread sampling
     # Fee assumptions
     polymarket_profit_fee: 0.0
     kalshi_profit_fee: 0.07
@@ -229,7 +250,7 @@ backtest:
   position_sizes_to_test: [100, 250, 500, 1000, 2500, 5000, 10000]
 
   # Reporting
-  output_dir: "data/output"
+  output_dir: "data/research"
   generate_html_report: true
 
 # =============================================================================
@@ -320,7 +341,7 @@ logging:
 # RESEARCH
 # =============================================================================
 research:
-  output_dir: "data/research_reports"
+  output_dir: "data/research"
 
   # Whale features
   whale_features:
@@ -363,7 +384,7 @@ experiments:
 # =============================================================================
 taxonomy:
   path: "config/taxonomy.yaml"
-  method: "hybrid"  # keyword, ml, hybrid
+  method: "hybrid" # keyword, ml, hybrid
   cache_classifications: true
 
 # =============================================================================

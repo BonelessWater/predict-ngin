@@ -1,0 +1,40 @@
+{
+  "run_id": "whale_following_20260214_203222_cc641d",
+  "strategy_name": "whale_following",
+  "timestamp": "2026-02-14T20:48:12.313457",
+  "git_commit": "99774c2aee13",
+  "git_branch": "main",
+  "code_version": null,
+  "parameters": {
+    "capital": 1000000,
+    "whales_followed": 615,
+    "categories": [
+      "Art_and_Culture",
+      "Climate_and_Science",
+      "Economy",
+      "Finance",
+      "Geopolitics",
+      "Politics",
+      "Sports",
+      "Tech"
+    ]
+  },
+  "config_snapshot": {
+    "whale": {
+      "capital": 1000000,
+      "min_usd": 100,
+      "train_ratio": 0.3
+    },
+    "whale_config": "WhaleConfig(mode=volume_only)"
+  },
+  "environment": {
+    "python_version": "3.14.2",
+    "platform": "Windows-11-10.0.26100-SP0",
+    "python_executable": "C:\\Python314\\python.exe"
+  },
+  "tags": [
+    "whale_following",
+    "polymarket"
+  ],
+  "notes": "volume_only=True unfavored_only=False"
+}

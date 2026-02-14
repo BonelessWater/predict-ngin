@@ -22,6 +22,26 @@ from .polymarket_whales import (
     run_polymarket_whale_analysis,
     POLY_WHALE_METHODS,
 )
+from .research_data_loader import (
+    load_research_trades,
+    load_research_markets,
+    load_resolution_winners,
+    ResearchPriceStore,
+    get_research_categories,
+)
+from .whale_scoring import (
+    calculate_whale_score,
+    qualifies_as_whale_signal,
+    WHALE_CRITERIA,
+    MIN_WHALE_SCORE,
+)
+from .whale_following_strategy import (
+    WhaleSignal,
+    Position,
+    StrategyState,
+    filter_and_score_signals,
+    calculate_position_size,
+)
 
 __version__ = "1.0.0"
 __all__ = [
@@ -40,4 +60,18 @@ __all__ = [
     "generate_whale_signals",
     "run_polymarket_whale_analysis",
     "POLY_WHALE_METHODS",
+    "load_research_trades",
+    "load_research_markets",
+    "load_resolution_winners",
+    "ResearchPriceStore",
+    "get_research_categories",
+    "calculate_whale_score",
+    "qualifies_as_whale_signal",
+    "WHALE_CRITERIA",
+    "MIN_WHALE_SCORE",
+    "WhaleSignal",
+    "Position",
+    "StrategyState",
+    "filter_and_score_signals",
+    "calculate_position_size",
 ]

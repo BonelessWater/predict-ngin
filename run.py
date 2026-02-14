@@ -12,10 +12,10 @@ Usage:
     python run.py --help             # Show all options
 
 Output:
-    data/output/summary.csv          # Strategy comparison
-    data/output/diagnostics.csv      # Data quality diagnostics
-    data/output/trades_*.csv         # Individual trade logs
-    data/output/quantstats_*.html    # Interactive QuantStats reports
+    data/research/summary.csv          # Strategy comparison
+    data/research/diagnostics.csv      # Data quality diagnostics
+    data/research/trades_*.csv         # Individual trade logs
+    data/research/quantstats_*.html    # Interactive QuantStats reports
 """
 
 import argparse
@@ -476,7 +476,7 @@ Examples:
     )
     parser.add_argument(
         "--output-dir",
-        default="data/output",
+        default="data/research",
         help="Output directory for reports",
     )
     parser.add_argument(
@@ -763,7 +763,7 @@ Examples:
     parser.add_argument(
         "--db-path",
         default="data/prediction_markets.db",
-        help="SQLite database path (default: data/prediction_markets.db)",
+        help="[DEPRECATED] SQLite path. Use data/research parquet instead.",
     )
 
     # New research pipeline options
@@ -832,9 +832,11 @@ Examples:
     print("WHALE FOLLOWING STRATEGY BACKTEST")
     print("=" * 70)
 
-    # Handle database build
+    # Handle database build (DEPRECATED: use data/research parquet instead)
     if args.build_db:
-        print("\n[0] Building SQLite database from JSON files...")
+        print("\n⚠️  DEPRECATED: --build-db is deprecated. Use data/research parquet instead.")
+        print("   Database generation will be removed in a future version.\n")
+        print("[0] Building SQLite database from JSON files...")
         db = build_database(
             db_path=args.db_path,
             import_polymarket=True,

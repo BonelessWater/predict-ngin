@@ -77,7 +77,7 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="data/output/parameter_tuning.json",
+        default="data/research/parameter_tuning.json",
         help="Output path for tuning results"
     )
     
