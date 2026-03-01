@@ -238,96 +238,117 @@ def filter_and_score_signals(
     If whale_scores_override is provided, uses those scores instead of calculate_whale_score.
     If whale_winrates_override is provided, uses those for historical_winrate (for Kelly sizing).
     """
-    from .whale_scoring import calculate_whale_score, calculate_performance_score
-
-    # Build market metadata
-    market_meta = {}
-    if not markets_df.empty and "market_id" in markets_df.columns:
-        for _, row in markets_df.iterrows():
-            mid = str(row.get("market_id", "")).strip()
-            market_meta[mid] = row.to_dict()
-
-    # Market liquidity (use volume as proxy if liquidity not in CSV)
-    market_liquidity = {}
-    for _, row in markets_df.iterrows():
-        mid = str(row.get("market_id", "")).strip()
-        liq = row.get("liquidityNum") or row.get("liquidity") or row.get("volume") or row.get("volumeNum")
-        if liq is not None:
-            try:
-                market_liquidity[mid] = float(liq)
-            except (TypeError, ValueError):
-                market_liquidity[mid] = 100_000  # Default
-        else:
-            market_liquidity[mid] = 100_000
-
-    signals = []
     trader_col = role
     direction_col = f"{role}_direction"
+    min_pos = (
+        min_position_size_override
+        if min_position_size_override is not None
+        else WHALE_CRITERIA["min_position_size"]
+    )
+    min_liq = (
+        min_market_liquidity_override
+        if min_market_liquidity_override is not None
+        else WHALE_CRITERIA["min_market_liquidity"]
+    )
+    size_threshold = max(min_usd, min_pos)
 
-    # Precompute whale win rates for sizing (unless override provided)
-    whale_winrates = whale_winrates_override if whale_winrates_override is not None else {}
-    if not whale_winrates:
-        for addr in trades_df[trader_col].unique():
-            resolved = trades_df[
-                (trades_df[trader_col] == addr) &
-                (trades_df["market_id"].astype(str).isin(resolution_winners.keys()))
-            ]
-            if len(resolved) >= 5:
-                from .whale_scoring import _get_resolved_trades
-                rt = _get_resolved_trades(trades_df, addr, resolution_winners, role)
-                if len(rt) >= 5:
-                    whale_winrates[addr] = rt["profitable"].mean()
+    # --- Build market metadata (vectorized) ---
+    market_meta: dict = {}
+    market_liquidity: dict = {}
+    if not markets_df.empty and "market_id" in markets_df.columns:
+        mdf = markets_df.copy()
+        mdf["_mid"] = mdf["market_id"].astype(str).str.strip()
+        market_meta = mdf.set_index("_mid").to_dict("index")
+        liq_col = next(
+            (c for c in ["liquidityNum", "liquidity", "volume", "volumeNum"]
+             if c in mdf.columns),
+            None,
+        )
+        if liq_col:
+            liq_series = pd.to_numeric(mdf[liq_col], errors="coerce").fillna(100_000)
+            market_liquidity = dict(zip(mdf["_mid"], liq_series))
 
-    for _, row in trades_df.iterrows():
-        if row["usd_amount"] < min_usd:
-            continue
-        if whale_set is not None and row[trader_col] not in whale_set:
-            continue
+    # --- Pre-filter trades (vectorized) ---
+    mask = trades_df["usd_amount"] >= size_threshold
+    if whale_set is not None:
+        mask &= trades_df[trader_col].isin(whale_set)
+    filtered = trades_df[mask].copy()
+    if filtered.empty:
+        return []
 
-        mid = str(row.get("market_id", "")).strip().replace(".0", "")
-        cat = row.get("category", "Unknown")
-        meta = market_meta.get(mid, {})
-        liq = market_liquidity.get(mid, 100_000)
+    filtered["_mid"] = (
+        filtered["market_id"].astype(str).str.strip().str.replace(".0", "", regex=False)
+    )
 
-        if whale_scores_override is not None:
-            score = whale_scores_override.get(row[trader_col], 0.0)
-        else:
-            score = calculate_whale_score(
-                row, trades_df, resolution_winners, meta, role,
-            )
-        if score < MIN_WHALE_SCORE:
-            continue
+    # Apply market liquidity filter (vectorized)
+    if market_liquidity and min_liq > 0:
+        filtered["_liq"] = filtered["_mid"].map(market_liquidity).fillna(100_000)
+        filtered = filtered[filtered["_liq"] >= min_liq]
+        if filtered.empty:
+            return []
 
-        # Time to resolution (simplified)
+    # --- Assign scores (vectorized when override provided) ---
+    if whale_scores_override is not None:
+        filtered["_score"] = filtered[trader_col].map(whale_scores_override).fillna(0.0)
+    else:
+        filtered["_score"] = filtered.apply(
+            lambda row: calculate_whale_score(
+                row, trades_df, resolution_winners,
+                market_meta.get(row["_mid"], {}), role,
+            ),
+            axis=1,
+        )
+
+    filtered = filtered[filtered["_score"] >= MIN_WHALE_SCORE]
+    if filtered.empty:
+        return []
+
+    # --- Precompute whale win rates (vectorized when not overridden) ---
+    if whale_winrates_override is not None:
+        whale_winrates: dict = whale_winrates_override
+    else:
+        whale_winrates = {}
+        resolved_ids = set(resolution_winners.keys())
+        res_mask = trades_df["market_id"].astype(str).isin(resolved_ids)
+        if res_mask.any():
+            rt = trades_df[res_mask].copy()
+            rt["_winner"] = rt["market_id"].astype(str).map(resolution_winners)
+            rt = rt.dropna(subset=["_winner"])
+            if not rt.empty:
+                dir_l = rt[direction_col].str.lower()
+                w_up = rt["_winner"].str.upper()
+                rt["_profitable"] = (
+                    ((dir_l == "buy") & (w_up == "YES")) |
+                    ((dir_l == "sell") & (w_up == "NO"))
+                )
+                wr_stats = rt.groupby(trader_col)["_profitable"].agg(["mean", "count"])
+                whale_winrates = wr_stats.loc[wr_stats["count"] >= 5, "mean"].to_dict()
+
+    # --- Build signals from the small pre-filtered set ---
+    signals = []
+    for _, row in filtered.iterrows():
+        mid = row["_mid"]
         ttr = None
+        meta = market_meta.get(mid, {})
         if meta:
             end = meta.get("endDateIso") or meta.get("endDate") or meta.get("closedTime")
             if end:
                 try:
-                    end_ts = pd.to_datetime(end)
-                    ttr = (end_ts - row["datetime"]).days
+                    ttr = (pd.to_datetime(end) - row["datetime"]).days
                 except Exception:
                     pass
-
-        min_pos = min_position_size_override if min_position_size_override is not None else WHALE_CRITERIA["min_position_size"]
-        min_liq = min_market_liquidity_override if min_market_liquidity_override is not None else WHALE_CRITERIA["min_market_liquidity"]
-        if row["usd_amount"] < min_pos or liq < min_liq:
-            continue
-        if score < MIN_WHALE_SCORE:
-            continue
         if ttr is not None and ttr > WHALE_CRITERIA["max_time_to_resolution"]:
             continue
 
-        winrate = whale_winrates.get(row[trader_col], 0.5) if whale_winrates else 0.5
-
+        winrate = whale_winrates.get(row[trader_col], 0.5)
         signals.append(WhaleSignal(
             market_id=mid,
-            category=cat,
+            category=row.get("category", "Unknown"),
             whale_address=row[trader_col],
             side=row[direction_col].upper() if pd.notna(row[direction_col]) else "BUY",
             price=float(row["price"]),
             size_usd=float(row["usd_amount"]),
-            score=score,
+            score=row["_score"],
             datetime=row["datetime"],
             historical_winrate=winrate,
         ))
