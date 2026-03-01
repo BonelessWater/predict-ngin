@@ -16,7 +16,6 @@ Usage:
 
 import argparse
 import sys
-import tempfile
 from pathlib import Path
 
 _project_root = Path(__file__).resolve().parent.parent.parent
@@ -26,8 +25,6 @@ sys.path.insert(0, str(_project_root / "src"))
 import numpy as np
 import pandas as pd
 
-from src.experiments.tracker import ExperimentTracker
-from src.backtest.storage import save_backtest_result
 from src.whale_strategy.research_data_loader import (
     load_research_trades,
     load_research_markets,
@@ -698,165 +695,59 @@ def main() -> int:
         return 0
 
     # combined mode (default)
-    if not args.no_tracker:
-        tracker = ExperimentTracker(experiments_dir=str(args.backtests_dir))
-        parameters = {
-            "capital": args.capital,
-            "min_usd": args.min_usd,
-            "train_ratio": args.train_ratio,
-            "volume_only": volume_only,
-            "surprise_only": surprise_only,
-            "unfavored_only": unfavored_only,
-        }
-        with tracker.run(
-            name="whale_following",
-            parameters=parameters,
-            tags=["whale_following", "polymarket", "backtest"],
-        ) as run:
-            run_id = run.run_id
-            print(f"  Run ID: {run_id}")
+    result = run_whale_category_backtest(
+        research_dir=research_dir,
+        capital=args.capital,
+        min_usd=args.min_usd,
+        position_size=args.position_size,
+        train_ratio=args.train_ratio,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        categories=categories,
+        db_path=args.db_path,
+        whale_config=whale_config,
+        surprise_only=surprise_only,
+        volume_only=volume_only,
+        unfavored_only=unfavored_only,
+        rebalance_freq="1M" if not args.no_rebalance else None,
+    )
 
-            result = run_whale_category_backtest(
-                research_dir=research_dir,
-                capital=args.capital,
-                min_usd=args.min_usd,
-                position_size=args.position_size,
-                train_ratio=args.train_ratio,
-                start_date=args.start_date,
-                end_date=args.end_date,
-                categories=categories,
-                db_path=args.db_path,
-                whale_config=whale_config,
-                surprise_only=surprise_only,
-                volume_only=volume_only,
-                unfavored_only=unfavored_only,
-                rebalance_freq="1M" if not args.no_rebalance else None,
-            )
+    if "error" in result:
+        print(f"\nError: {result['error']}")
+        if "whales" in result:
+            print(f"  Whales: {result['whales']}, Signals: {result.get('signals', 0)}")
+        return 1
 
-            if "error" in result:
-                raise RuntimeError(result["error"])
+    print("\n" + "=" * 60)
+    print("RESULTS")
+    print("=" * 60)
+    print(f"Total Trades:     {result['total_trades']:,}")
+    print(f"Win Rate:         {result['win_rate']*100:.1f}%")
+    print(f"Net P&L:         ${result['total_net_pnl']:,.2f}")
+    print(f"ROI:              {result['roi_pct']:.2f}%")
+    print(f"Whales Followed:  {result['whales_followed']:,}")
+    print(f"Signals:          {result['signals_processed']:,}")
+    print(f"Categories:       {', '.join(result['categories'])}")
 
-            print("\n" + "=" * 60)
-            print("RESULTS")
-            print("=" * 60)
-            print(f"Total Trades:     {result['total_trades']:,}")
-            print(f"Win Rate:         {result['win_rate']*100:.1f}%")
-            print(f"Net P&L:         ${result['total_net_pnl']:,.2f}")
-            print(f"ROI:              {result['roi_pct']:.2f}%")
-            print(f"Whales Followed:  {result['whales_followed']:,}")
-            print(f"Signals:          {result['signals_processed']:,}")
-            print(f"Categories:       {', '.join(result['categories'])}")
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-            output_dir = args.output_dir
-            output_dir.mkdir(parents=True, exist_ok=True)
+    if args.output and "trades_df" in result:
+        result["trades_df"].to_csv(args.output, index=False)
+        print(f"\nTrades saved to {args.output}")
+    elif "trades_df" in result:
+        trades_path = output_dir / "whale_backtest_trades.csv"
+        result["trades_df"].to_csv(trades_path, index=False)
+        print(f"\nTrades saved to {trades_path}")
 
-            if args.output and "trades_df" in result:
-                result["trades_df"].to_csv(args.output, index=False)
-                print(f"\nTrades saved to {args.output}")
-            elif "trades_df" in result:
-                trades_path = output_dir / "whale_backtest_trades.csv"
-                result["trades_df"].to_csv(trades_path, index=False)
-                print(f"\nTrades saved to {trades_path}")
-
-            quantstats_path = None
-            if not args.no_quantstats and "daily_returns" in result and len(result["daily_returns"]) >= 5:
-                temp_quantstats = Path(tempfile.gettempdir()) / f"quantstats_{run_id}.html"
-                if generate_quantstats_report(
-                    result["daily_returns"],
-                    str(temp_quantstats),
-                    title="Whale Following Strategy (Category-Level)",
-                ):
-                    quantstats_path = temp_quantstats
-                    print(f"QuantStats tearsheet: {temp_quantstats}")
-
-            result["capital"] = args.capital
-            config_snapshot = {
-                "whale": {"capital": args.capital, "min_usd": args.min_usd, "train_ratio": args.train_ratio},
-                "whale_config": str(whale_config),
-            }
-            saved_run_id = save_backtest_result(
-                strategy_name="whale_following",
-                result=result,
-                config=config_snapshot,
-                run_id=run_id,
-                base_dir=args.backtests_dir,
-                tags=["whale_following", "polymarket"],
-                notes=f"volume_only={volume_only} unfavored_only={unfavored_only}",
-                quantstats_html_path=quantstats_path,
-                auto_index=True,
-            )
-
-            sharpe = 0.0
-            if "daily_returns" in result and len(result["daily_returns"]) >= 2:
-                dr = result["daily_returns"]
-                sharpe = float((dr.mean() / dr.std() * (252 ** 0.5)) if dr.std() > 0 else 0)
-            tracker.log_metrics(run_id, {
-                "sharpe_ratio": sharpe,
-                "win_rate": result["win_rate"],
-                "total_net_pnl": result["total_net_pnl"],
-                "roi_pct": result["roi_pct"],
-                "total_trades": result["total_trades"],
-                "whales_followed": result["whales_followed"],
-            })
-            run_dir = args.backtests_dir / "whale_following" / run_id / "results"
-            if run_dir.exists():
-                tracker.log_artifact(run_id, "trades", str(run_dir / "trades.csv"), copy=False)
-
-            print(f"\nBacktest saved and tracked: {saved_run_id}")
-    else:
-        result = run_whale_category_backtest(
-            research_dir=research_dir,
-            capital=args.capital,
-            min_usd=args.min_usd,
-            position_size=args.position_size,
-            train_ratio=args.train_ratio,
-            start_date=args.start_date,
-            end_date=args.end_date,
-            categories=categories,
-            db_path=args.db_path,
-            whale_config=whale_config,
-            surprise_only=surprise_only,
-            volume_only=volume_only,
-            unfavored_only=unfavored_only,
-            rebalance_freq="1M" if not args.no_rebalance else None,
-        )
-
-        if "error" in result:
-            print(f"\nError: {result['error']}")
-            if "whales" in result:
-                print(f"  Whales: {result['whales']}, Signals: {result.get('signals', 0)}")
-            return 1
-
-        print("\n" + "=" * 60)
-        print("RESULTS")
-        print("=" * 60)
-        print(f"Total Trades:     {result['total_trades']:,}")
-        print(f"Win Rate:         {result['win_rate']*100:.1f}%")
-        print(f"Net P&L:         ${result['total_net_pnl']:,.2f}")
-        print(f"ROI:              {result['roi_pct']:.2f}%")
-        print(f"Whales Followed:  {result['whales_followed']:,}")
-        print(f"Signals:          {result['signals_processed']:,}")
-        print(f"Categories:       {', '.join(result['categories'])}")
-
-        output_dir = args.output_dir
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        if args.output and "trades_df" in result:
-            result["trades_df"].to_csv(args.output, index=False)
-            print(f"\nTrades saved to {args.output}")
-        elif "trades_df" in result:
-            trades_path = output_dir / "whale_backtest_trades.csv"
-            result["trades_df"].to_csv(trades_path, index=False)
-            print(f"\nTrades saved to {trades_path}")
-
-        if not args.no_quantstats and "daily_returns" in result and len(result["daily_returns"]) >= 5:
-            quantstats_path = output_dir / "quantstats_whale_following.html"
-            if generate_quantstats_report(
-                result["daily_returns"],
-                str(quantstats_path),
-                title="Whale Following Strategy (Category-Level)",
-            ):
-                print(f"QuantStats tearsheet: {quantstats_path}")
+    if not args.no_quantstats and "daily_returns" in result and len(result["daily_returns"]) >= 5:
+        quantstats_path = output_dir / "quantstats_whale_following.html"
+        if generate_quantstats_report(
+            result["daily_returns"],
+            str(quantstats_path),
+            title="Whale Following Strategy (Category-Level)",
+        ):
+            print(f"QuantStats tearsheet: {quantstats_path}")
 
     return 0
 

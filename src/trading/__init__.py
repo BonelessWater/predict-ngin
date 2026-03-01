@@ -2,7 +2,22 @@
 General trading engine, strategies, and risk management.
 """
 
-from .data_modules.costs import CostAssumptions, CostModel, COST_ASSUMPTIONS, DEFAULT_COST_MODEL
+from .data_modules.costs import (
+    CostAssumptions,
+    CostModel,
+    COST_ASSUMPTIONS,
+    DEFAULT_COST_MODEL,
+    POLYMARKET_ZERO_COST_MODEL,
+    SpreadEstimator,
+    SlippageModel,
+    LiquidityFilter,
+    LiquidityFilterConfig,
+)
+from .execution import (
+    FillResult,
+    TradeBasedExecutionEngine,
+    LOBExecutionEngine,
+)
 from .engine import TradingEngine, EngineConfig, BacktestResult, Event, EventType
 from .risk import (
     RiskManager,
@@ -109,6 +124,7 @@ __all__ = [
     "CostModel",
     "COST_ASSUMPTIONS",
     "DEFAULT_COST_MODEL",
+    "POLYMARKET_ZERO_COST_MODEL",
     "TradingEngine",
     "EngineConfig",
     "BacktestResult",
@@ -189,4 +205,11 @@ __all__ = [
     "signals_dataframe_to_backtest_format",
     "generate_momentum_signals_from_trades",
     "trades_to_price_history",
+    "SpreadEstimator",
+    "SlippageModel",
+    "LiquidityFilter",
+    "LiquidityFilterConfig",
+    "FillResult",
+    "TradeBasedExecutionEngine",
+    "LOBExecutionEngine",
 ]

@@ -8,7 +8,13 @@ New code should import from the reorganized modules:
   - src.taxonomy for market categorization
 """
 
-from .costs import CostAssumptions, CostModel, COST_ASSUMPTIONS, DEFAULT_COST_MODEL
+from .costs import (
+    CostAssumptions,
+    CostModel,
+    COST_ASSUMPTIONS,
+    DEFAULT_COST_MODEL,
+    POLYMARKET_ZERO_COST_MODEL,
+)
 from .categories import CATEGORIES, categorize_market, categorize_markets
 from .data import (
     DEFAULT_DB_PATH,
@@ -28,6 +34,7 @@ __all__ = [
     "CostModel",
     "COST_ASSUMPTIONS",
     "DEFAULT_COST_MODEL",
+    "POLYMARKET_ZERO_COST_MODEL",
     # Categories (legacy - prefer src.taxonomy)
     "CATEGORIES",
     "categorize_market",

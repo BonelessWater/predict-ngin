@@ -34,6 +34,10 @@ class PolymarketBacktestConfig:
     enforce_one_position_per_market: bool = True
     min_liquidity: float = 0.0
     min_volume: float = 0.0
+    # Resolution-aware exit settings
+    resolution_aware: bool = True
+    forced_exit_hours_before_resolution: int = 24
+    near_resolution_slippage_multiplier: float = 2.0
 
 
 @dataclass
@@ -321,6 +325,7 @@ def run_polymarket_backtest(
     cost_model: Optional[CostModel] = None,
     portfolio_constraints: Optional[PortfolioConstraints] = None,
     position_sizer: Optional[PositionSizer] = None,
+    execution_engine=None,
 ) -> PolymarketBacktestResult:
     """
     Convert signals into simulated Polymarket trades using CLOB price history.
@@ -334,6 +339,9 @@ def run_polymarket_backtest(
       - size (position size)
       - exit_time (timestamp/datetime)
       - hold_seconds (override max_holding_seconds)
+      - execution_engine: TradeBasedExecutionEngine for realistic tape-walking fills.
+        When provided, entry/exit prices come from the trade tape (VWAP) instead of
+        price_store lookups + flat cost model.
     """
     if config is None:
         config = PolymarketBacktestConfig()
@@ -341,6 +349,8 @@ def run_polymarket_backtest(
         cost_model = DEFAULT_COST_MODEL
     if price_store is None:
         price_store = ClobPriceStore()
+
+    use_tape = execution_engine is not None
 
     signals_df = _normalize_signals(signals)
     if signals_df.empty:
@@ -396,19 +406,7 @@ def run_polymarket_backtest(
         if not portfolio_constraints.market_allowed("", liquidity, volume):
             continue
 
-        price_point = price_store.price_at_or_after(market_id, outcome, entry_ts)
-        if price_point is None:
-            continue
-        entry_fill_ts = int(price_point["timestamp"])
-        entry_price = price_point["price"]
-        if entry_price <= 0 or entry_price >= 1:
-            continue
-        entry_time = pd.to_datetime(entry_fill_ts, unit="s")
-
-        if resolution_ts is not None and entry_fill_ts >= resolution_ts:
-            continue
-
-        portfolio.close_positions_through(entry_time)
+        portfolio.close_positions_through(pd.to_datetime(signal_ts, unit="s"))
 
         signal_size = signal.get("size", np.nan)
         if pd.isna(signal_size):
@@ -427,6 +425,36 @@ def run_polymarket_backtest(
         if not portfolio.can_open("", effective_size):
             continue
 
+        # ---- Entry execution ----
+        if use_tape:
+            fill = execution_engine.execute_order(
+                market_id, outcome, side, effective_size,
+                signal_ts, config.fill_latency_seconds,
+            )
+            if not fill.filled:
+                continue
+            entry_price = fill.fill_price
+            entry_fill_ts = fill.fill_timestamp
+            effective_size = fill.fill_size  # may be partial
+            entry_cost_price = entry_price   # costs already baked into VWAP + spread + slippage
+        else:
+            price_point = price_store.price_at_or_after(market_id, outcome, entry_ts)
+            if price_point is None:
+                continue
+            entry_fill_ts = int(price_point["timestamp"])
+            entry_price = price_point["price"]
+            if entry_price <= 0 or entry_price >= 1:
+                continue
+            entry_cost_price = _effective_entry_price(
+                cost_model, entry_price, effective_size, liquidity, side,
+            )
+
+        entry_time = pd.to_datetime(entry_fill_ts, unit="s")
+
+        if resolution_ts is not None and entry_fill_ts >= resolution_ts:
+            continue
+
+        # ---- Determine exit timing ----
         exit_ts_source = None
         exit_ts = _to_timestamp_seconds(signal.get("exit_time", None))
         if exit_ts is not None:
@@ -451,12 +479,25 @@ def run_polymarket_backtest(
         exit_fill_ts: Optional[int] = None
         exit_reason = exit_ts_source or "exit_time"
 
+        # ---- Resolution-aware exit logic ----
         use_resolution = False
         if resolution_value is not None:
             if exit_ts_source in (None, "end_date"):
                 use_resolution = True
             elif resolution_ts is not None:
                 use_resolution = exit_ts >= resolution_ts
+
+        # Forced pre-resolution exit: if near resolution and config says so
+        forced_pre_resolution = False
+        if (
+            config.resolution_aware
+            and resolution_ts is not None
+            and not use_resolution
+            and exit_ts is not None
+        ):
+            hours_before = (resolution_ts - exit_ts) / 3600.0
+            if 0 < hours_before <= config.forced_exit_hours_before_resolution:
+                forced_pre_resolution = True
 
         if use_resolution:
             exit_reason = "resolution"
@@ -473,48 +514,86 @@ def run_polymarket_backtest(
                     exit_fill_ts = entry_fill_ts
                     exit_time = entry_time
         else:
-            if exit_ts is not None:
-                exit_point = price_store.price_at_or_after(market_id, outcome, exit_ts)
+            # ---- Exit execution ----
+            if use_tape and exit_ts is not None:
+                exit_fill = execution_engine.execute_order(
+                    market_id, outcome,
+                    "SELL" if side == "BUY" else "BUY",
+                    effective_size, exit_ts, 0,
+                )
+                if exit_fill.filled:
+                    exit_fill_ts = exit_fill.fill_timestamp
+                    exit_price = exit_fill.fill_price
+                    exit_time = pd.to_datetime(exit_fill_ts, unit="s")
+                else:
+                    # Fall back to price_store
+                    exit_point = price_store.price_at_or_after(market_id, outcome, exit_ts)
+                    if exit_point is None:
+                        last_point = price_store.last_price(market_id, outcome)
+                        if last_point is None:
+                            continue
+                        if not config.include_open:
+                            continue
+                        exit_fill_ts = int(last_point["timestamp"])
+                        exit_price = last_point["price"]
+                        exit_time = pd.to_datetime(exit_fill_ts, unit="s")
+                        status = "open"
+                        exit_reason = "open"
+                    else:
+                        exit_fill_ts = int(exit_point["timestamp"])
+                        exit_price = exit_point["price"]
+                        exit_time = pd.to_datetime(exit_fill_ts, unit="s")
             else:
-                exit_point = None
+                if exit_ts is not None:
+                    exit_point = price_store.price_at_or_after(market_id, outcome, exit_ts)
+                else:
+                    exit_point = None
 
-            if exit_point is None:
-                last_point = price_store.last_price(market_id, outcome)
-                if last_point is None:
-                    continue
-                if not config.include_open:
-                    continue
-                exit_fill_ts = int(last_point["timestamp"])
-                exit_price = last_point["price"]
-                exit_time = pd.to_datetime(exit_fill_ts, unit="s")
-                status = "open"
-                exit_reason = "open"
-            else:
-                exit_fill_ts = int(exit_point["timestamp"])
-                exit_price = exit_point["price"]
-                exit_time = pd.to_datetime(exit_fill_ts, unit="s")
+                if exit_point is None:
+                    last_point = price_store.last_price(market_id, outcome)
+                    if last_point is None:
+                        continue
+                    if not config.include_open:
+                        continue
+                    exit_fill_ts = int(last_point["timestamp"])
+                    exit_price = last_point["price"]
+                    exit_time = pd.to_datetime(exit_fill_ts, unit="s")
+                    status = "open"
+                    exit_reason = "open"
+                else:
+                    exit_fill_ts = int(exit_point["timestamp"])
+                    exit_price = exit_point["price"]
+                    exit_time = pd.to_datetime(exit_fill_ts, unit="s")
+
+        if forced_pre_resolution:
+            exit_reason = "forced_pre_resolution"
 
         direction = 1 if side == "BUY" else -1
 
-        entry_cost_price = _effective_entry_price(
-            cost_model,
-            entry_price,
-            effective_size,
-            liquidity,
-            side,
-        )
         exit_cost_price = None
         if status == "closed":
             if exit_reason == "resolution":
-                exit_cost_price = exit_price
+                exit_cost_price = exit_price  # binary payoff, no cost
+            elif use_tape:
+                exit_cost_price = exit_price  # costs baked into tape VWAP
+                # Apply extra slippage near resolution
+                if forced_pre_resolution:
+                    extra = abs(exit_price) * (config.near_resolution_slippage_multiplier - 1) * 0.01
+                    if side == "BUY":
+                        exit_cost_price = exit_price - extra
+                    else:
+                        exit_cost_price = exit_price + extra
             else:
                 exit_cost_price = _effective_exit_price(
-                    cost_model,
-                    exit_price,
-                    effective_size,
-                    liquidity,
-                    side,
+                    cost_model, exit_price, effective_size, liquidity, side,
                 )
+                # Apply extra slippage near resolution
+                if forced_pre_resolution:
+                    extra = abs(exit_price) * (config.near_resolution_slippage_multiplier - 1) * 0.01
+                    if side == "BUY":
+                        exit_cost_price -= extra
+                    else:
+                        exit_cost_price += extra
             net_pnl = direction * (exit_cost_price - entry_cost_price) * effective_size
         else:
             net_pnl = direction * (exit_price - entry_cost_price) * effective_size

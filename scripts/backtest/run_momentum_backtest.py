@@ -32,9 +32,7 @@ from trading import (
     generate_quantstats_report,
     generate_all_reports,
 )
-from src.experiments.tracker import ExperimentTracker
 from src.backtest.storage import save_backtest_result
-from src.backtest.catalog import BacktestCatalog
 
 
 def _load_config():
@@ -232,135 +230,58 @@ def main() -> int:
             } if config and hasattr(config, "strategies") else {},
         }
     
-    # Run backtest with tracking
-    if not args.no_tracker:
-        tracker = ExperimentTracker(experiments_dir=args.backtests_dir)
-        
-        with tracker.run(
-            name="momentum",
-            parameters=parameters,
-            tags=["momentum", "polymarket", "backtest"],
-        ) as run:
-            run_id = run.run_id
-            print(f"  Run ID: {run_id}")
-            
-            result = run_polymarket_backtest(
-                signals=signals_df,
-                price_store=price_store,
-                config=bt_config,
-            )
-            price_store.close()
+    # Run backtest
+    result = run_polymarket_backtest(
+        signals=signals_df,
+        price_store=price_store,
+        config=bt_config,
+    )
+    price_store.close()
 
-            print_polymarket_result(result)
+    print_polymarket_result(result)
 
-            # Generate quantstats report to temporary location first
-            quantstats_path = None
-            if not args.no_quantstats and result.daily_returns is not None and len(result.daily_returns) >= 5:
-                import tempfile
-                temp_dir = Path(tempfile.gettempdir())
-                temp_quantstats = temp_dir / f"quantstats_{run_id}.html"
-                ok = generate_quantstats_report(
-                    result.daily_returns,
-                    str(temp_quantstats),
-                    title="Momentum Backtest Report",
-                )
-                if ok:
-                    quantstats_path = temp_quantstats
-                    print(f"\nQuantStats report generated: {temp_quantstats}")
-
-            # Save to organized storage
-            try:
-                saved_run_id = save_backtest_result(
-                    strategy_name="momentum",
-                    result=result,
-                    config=config_snapshot,
-                    run_id=run_id,
-                    base_dir=args.backtests_dir,
-                    tags=["momentum", "polymarket"],
-                    notes=f"Threshold: {threshold}, Position Size: {position_size}",
-                    signals_df=signals_df,
-                    quantstats_html_path=quantstats_path,
-                    auto_index=True,
-                )
-                
-                # Log metrics to tracker
-                tracker.log_metrics(run_id, {
-                    "sharpe_ratio": result.summary.metrics.sharpe_ratio,
-                    "win_rate": result.summary.metrics.win_rate,
-                    "total_net_pnl": result.summary.metrics.total_net_pnl,
-                    "roi_pct": result.summary.metrics.roi_pct,
-                    "total_trades": result.summary.metrics.total_trades,
-                    "max_drawdown": result.summary.metrics.max_drawdown,
-                })
-                
-                # Log artifacts
-                tracker.log_artifact(
-                    run_id,
-                    "trades",
-                    f"{args.backtests_dir}/momentum/{run_id}/results/trades.csv",
-                    copy=False,
-                )
-                
-                print(f"\n✓ Backtest saved and tracked: {saved_run_id}")
-                if quantstats_path:
-                    print(f"  QuantStats report: {args.backtests_dir}/momentum/{run_id}/results/quantstats.html")
-            except Exception as e:
-                print(f"\n⚠ Warning: Failed to save to organized storage: {e}")
-                import traceback
-                traceback.print_exc()
-    else:
-        # Run without tracking
-        result = run_polymarket_backtest(
-            signals=signals_df,
-            price_store=price_store,
-            config=bt_config,
+    # Generate quantstats report
+    quantstats_path = None
+    if not args.no_quantstats and result.daily_returns is not None and len(result.daily_returns) >= 5:
+        import tempfile
+        temp_dir = Path(tempfile.gettempdir())
+        temp_quantstats = temp_dir / f"quantstats_temp_{uuid.uuid4().hex[:8]}.html"
+        ok = generate_quantstats_report(
+            result.daily_returns,
+            str(temp_quantstats),
+            title="Momentum Backtest Report",
         )
-        price_store.close()
+        if ok:
+            quantstats_path = temp_quantstats
 
-        print_polymarket_result(result)
-        
-        # Generate quantstats report to temporary location first
-        quantstats_path = None
-        if not args.no_quantstats and result.daily_returns is not None and len(result.daily_returns) >= 5:
-            import tempfile
-            temp_dir = Path(tempfile.gettempdir())
-            temp_quantstats = temp_dir / f"quantstats_temp_{uuid.uuid4().hex[:8]}.html"
-            ok = generate_quantstats_report(
-                result.daily_returns,
-                str(temp_quantstats),
-                title="Momentum Backtest Report",
-            )
-            if ok:
-                quantstats_path = temp_quantstats
-        
-        # Save to organized storage (without tracker)
-        try:
-            saved_run_id = save_backtest_result(
-                strategy_name="momentum",
-                result=result,
-                config=config_snapshot,
-                base_dir=args.backtests_dir,
-                tags=["momentum", "polymarket"],
-                notes=f"Threshold: {threshold}, Position Size: {position_size}",
-                signals_df=signals_df,
-                quantstats_html_path=quantstats_path,
-                auto_index=True,
-            )
-            print(f"\n✓ Backtest saved: {saved_run_id}")
-            if quantstats_path:
-                print(f"  QuantStats report: {args.backtests_dir}/momentum/{saved_run_id}/results/quantstats.html")
-        except Exception as e:
-            print(f"\n⚠ Warning: Failed to save to organized storage: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # Also save to legacy output_dir for backward compatibility
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
+    # Save to organized storage
+    try:
+        saved_run_id = save_backtest_result(
+            strategy_name="momentum",
+            result=result,
+            config=config_snapshot,
+            base_dir=args.backtests_dir,
+            tags=["momentum", "polymarket"],
+            notes=f"Threshold: {threshold}, Position Size: {position_size}",
+            signals_df=signals_df,
+            quantstats_html_path=quantstats_path,
+            auto_index=True,
+        )
+        print(f"\n✓ Backtest saved: {saved_run_id}")
         if quantstats_path:
-            legacy_path = Path(output_dir) / "quantstats_momentum.html"
-            import shutil
-            shutil.copy2(quantstats_path, legacy_path)
-            print(f"  Legacy report: {legacy_path}")
+            print(f"  QuantStats report: {args.backtests_dir}/momentum/{saved_run_id}/results/quantstats.html")
+    except Exception as e:
+        print(f"\n⚠ Warning: Failed to save to organized storage: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Also save to legacy output_dir for backward compatibility
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    if quantstats_path:
+        legacy_path = Path(output_dir) / "quantstats_momentum.html"
+        import shutil
+        shutil.copy2(quantstats_path, legacy_path)
+        print(f"  Legacy report: {legacy_path}")
 
     return 0
 

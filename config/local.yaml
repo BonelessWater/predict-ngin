@@ -34,7 +34,7 @@ data:
 # =============================================================================
 whale_strategy:
   # Identification method
-  method: "win_rate_60pct" # Options: volume_top10, volume_pct95, large_trades, win_rate_60pct, combo_vol_win, profit_proxy
+  method: "volume_pct95" # Options:  win_rate_60pct, volume_top10, volume_pct95, large_trades, win_rate_60pct, combo_vol_win, profit_proxy
 
   # Filters
   min_trades: 20
@@ -167,6 +167,30 @@ costs:
   base_slippage_bps: 50 # 0.5%
   impact_coefficient: 0.5
   fee_rate_bps: 10 # 0.1%
+
+# =============================================================================
+# REALISTIC EXECUTION (trade-tape based)
+# =============================================================================
+execution:
+  enabled: true
+  # Spread estimation
+  spread_window_seconds: 3600
+  default_spread: 0.02
+  # Slippage model
+  slippage_calibrate: true
+  max_slippage: 0.10
+  # Liquidity filter
+  min_volume_window_hours: 24
+  min_volume_usd: 500
+  max_size_to_volume_ratio: 0.10
+  fill_probability_model: true
+  # Tape fill
+  fill_window_seconds: 3600
+  min_fill_fraction: 0.10
+  # Resolution-aware exits
+  resolution_aware: true
+  forced_exit_hours_before_resolution: 24
+  near_resolution_slippage_multiplier: 2.0
 
 # =============================================================================
 # BACKTESTING

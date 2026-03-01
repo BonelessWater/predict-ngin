@@ -10,6 +10,7 @@ from .data_modules.costs import (  # noqa: F401
     CostModel,
     COST_ASSUMPTIONS,
     DEFAULT_COST_MODEL,
+    POLYMARKET_ZERO_COST_MODEL,
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "CostModel",
     "COST_ASSUMPTIONS",
     "DEFAULT_COST_MODEL",
+    "POLYMARKET_ZERO_COST_MODEL",
 ]
