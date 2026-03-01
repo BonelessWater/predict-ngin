@@ -621,6 +621,8 @@ def generate_quantstats_report(
         True if successful, False otherwise
     """
     try:
+        import matplotlib
+        matplotlib.rcParams.update({"font.family": "DejaVu Sans", "font.sans-serif": ["DejaVu Sans"]})
         import quantstats as qs
     except ImportError:
         warnings.warn(
