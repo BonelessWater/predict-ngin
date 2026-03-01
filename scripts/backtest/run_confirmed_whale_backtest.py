@@ -446,7 +446,7 @@ def main() -> int:
     print(f"  {len(markets_df):,} markets")
 
     print("Loading resolutions...")
-    resolution_winners = load_resolution_winners(args.research_dir, categories=run_cats)
+    resolution_winners = load_resolution_winners(args.research_dir)
     print(f"  {len(resolution_winners):,} resolved markets")
 
     # ── Build market liquidity map ───────────────────────────────────────────
