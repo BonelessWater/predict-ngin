@@ -226,15 +226,21 @@ class _PageCounter:
 
 # ── Session factory ───────────────────────────────────────────────────────────
 
+# Global semaphore caps concurrent requests across all threads to avoid 429s.
+# 12 is empirically safe for the Polymarket Gamma API without rate-limit drops.
+_REQUEST_SEM = threading.Semaphore(12)
+
 def _make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": "predict-ngin/1.0 (research)"})
     retry = Retry(
-        total=6, backoff_factor=0.4,
+        total=10,
+        backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
+        respect_retry_after_header=True,
     )
-    s.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=50))
+    s.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=20))
     return s
 
 
@@ -248,6 +254,7 @@ def _fetch_all_parallel(
 ) -> List[dict]:
     """
     Parallel pagination: workers race to fetch pages until one gets empty.
+    A global semaphore caps simultaneous in-flight requests to avoid 429s.
     Returns flat list of all items.
     """
     counter  = _PageCounter()
@@ -256,7 +263,7 @@ def _fetch_all_parallel(
     dot_lock = threading.Lock()
     pages_done = [0]
 
-    session  = _make_session()
+    session = _make_session()
 
     def worker():
         local: List[dict] = []
@@ -264,18 +271,19 @@ def _fetch_all_parallel(
             offset = counter.next_offset()
             if offset is None:
                 break
-            try:
-                r = session.get(
-                    endpoint,
-                    params={**base_params, "offset": offset, "limit": PAGE_SIZE},
-                    timeout=30,
-                )
-                r.raise_for_status()
-                batch = r.json()
-            except Exception as exc:
-                # Transient error – skip page, do not stop
-                print(f"\n  WARN [{label}] offset={offset}: {exc}")
-                continue
+            with _REQUEST_SEM:
+                try:
+                    r = session.get(
+                        endpoint,
+                        params={**base_params, "offset": offset, "limit": PAGE_SIZE},
+                        timeout=30,
+                    )
+                    r.raise_for_status()
+                    batch = r.json()
+                except Exception as exc:
+                    # Transient error – skip page, do not stop
+                    print(f"\n  WARN [{label}] offset={offset}: {exc}")
+                    continue
 
             if not batch:
                 counter.stop()
@@ -328,11 +336,12 @@ def _api_category_to_folder(raw: Optional[str]) -> str:
 
 # ── Main logic ────────────────────────────────────────────────────────────────
 
-def run(output_dir: Path, n_workers: int, include_closed: bool, dry_run: bool):
+def run(output_dir: Path, n_workers: int, include_closed: bool, dry_run: bool,
+        min_volume: float = 0.0):
     t0 = time.time()
 
     # ── Phase 1: fetch events + markets simultaneously ────────────────────
-    print("Phase 1: fetching from Gamma API …")
+    print("Phase 1: fetching from Gamma API ...")
 
     event_params  = {"active": "true"}
     market_params = {}
@@ -370,7 +379,7 @@ def run(output_dir: Path, n_workers: int, include_closed: bool, dry_run: bool):
     print(f"  {len(event_cat):,} events with known category")
 
     # ── Phase 3: classify & normalise markets ─────────────────────────────
-    print("Phase 3: classifying markets …")
+    print("Phase 3: classifying markets ...")
     buckets: Dict[str, List[dict]] = defaultdict(list)
     seen_ids: Set[str] = set()
 
@@ -379,6 +388,12 @@ def run(output_dir: Path, n_workers: int, include_closed: bool, dry_run: bool):
         if not cid or cid in seen_ids:
             continue
         seen_ids.add(cid)
+
+        # Volume filter
+        if min_volume > 0:
+            vol = float(m.get("volumeNum") or m.get("volume") or 0)
+            if vol < min_volume:
+                continue
 
         # Try event tags first (most accurate)
         cat = None
@@ -416,7 +431,7 @@ def run(output_dir: Path, n_workers: int, include_closed: bool, dry_run: bool):
     print(f"  {sum(len(v) for v in buckets.values()):,} unique markets classified")
 
     # ── Phase 4: write CSVs ───────────────────────────────────────────────
-    print("Phase 4: writing CSVs …")
+    print("Phase 4: writing CSVs ...")
     all_cats = CATEGORY_PRIORITY + ["Other"]
 
     print(f"\n{'Category':<22}  {'Markets':>8}  Output")
@@ -462,6 +477,8 @@ def main() -> int:
                    help="Number of parallel fetch threads (default: 35)")
     p.add_argument("--include-closed", action="store_true",
                    help="Include closed/resolved markets (default: active only)")
+    p.add_argument("--min-volume", type=float, default=0.0,
+                   help="Minimum market volume in USD to include (default: 0)")
     p.add_argument("--dry-run", action="store_true",
                    help="Show what would be written without creating files")
     args = p.parse_args()
@@ -473,10 +490,12 @@ def main() -> int:
     print(f"Output dir    : {output_dir}")
     print(f"Workers       : {args.workers}")
     print(f"Include closed: {args.include_closed}")
+    print(f"Min volume    : ${args.min_volume:,.0f}")
     print(f"Dry run       : {args.dry_run}")
     print()
 
-    run(output_dir, args.workers, args.include_closed, args.dry_run)
+    run(output_dir, args.workers, args.include_closed, args.dry_run,
+        min_volume=args.min_volume)
     return 0
 
 
