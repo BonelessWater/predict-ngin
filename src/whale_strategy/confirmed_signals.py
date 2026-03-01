@@ -69,7 +69,8 @@ def extract_confirmed_signals(
 
     # ── Steps 1-5: vectorised pre-filter ────────────────────────────────────
     df = trades_df.copy()
-    df["_mid"] = (
+    # Use non-underscore names so itertuples namedtuple fields stay valid
+    df["xmid"] = (
         df["market_id"].astype(str).str.strip().str.replace(".0", "", regex=False)
     )
 
@@ -86,24 +87,24 @@ def extract_confirmed_signals(
         mask &= df["category"].str.lower().isin(allowed_lower)
 
     # 4. Market liquidity
-    df["_liq"] = df["_mid"].map(market_liquidity).fillna(0.0)
-    mask &= df["_liq"] >= min_market_volume
+    df["xliq"] = df["xmid"].map(market_liquidity).fillna(0.0)
+    mask &= df["xliq"] >= min_market_volume
 
     # 5a. Wallet win rate
-    df["_wr"] = df[trader_col].map(whale_winrates).fillna(0.0)
-    mask &= df["_wr"] >= min_wallet_wr
+    df["xwr"] = df[trader_col].map(whale_winrates).fillna(0.0)
+    mask &= df["xwr"] >= min_wallet_wr
 
     # 5b. Price impact
-    safe_liq = df["_liq"].replace(0, np.nan)
-    df["_impact"] = df["usd_amount"] / safe_liq
-    mask &= df["_impact"] <= max_price_impact
+    safe_liq = df["xliq"].replace(0, np.nan)
+    df["ximpact"] = df["usd_amount"] / safe_liq
+    mask &= df["ximpact"] <= max_price_impact
 
     filtered = df[mask].sort_values("datetime").reset_index(drop=True)
     if filtered.empty:
         return pd.DataFrame()
 
     # ── Step 6: sequential confirmation scan ────────────────────────────────
-    window_td  = pd.Timedelta(hours=confirmation_window_hours)
+    window_td   = pd.Timedelta(hours=confirmation_window_hours)
     cooldown_td = pd.Timedelta(hours=cooldown_hours)
 
     # (market_id, direction) -> list[(datetime, trader)]
@@ -113,7 +114,7 @@ def extract_confirmed_signals(
     confirmed: list = []
 
     for row in filtered.itertuples(index=False):
-        mid       = row._mid
+        mid       = row.xmid
         direction = (
             str(getattr(row, direction_col, "buy")).lower()
             if pd.notna(getattr(row, direction_col, None)) else "buy"
@@ -124,7 +125,6 @@ def extract_confirmed_signals(
 
         # Enforce cooldown
         if key in last_signal and (t - last_signal[key]) < cooldown_td:
-            # Within cooldown — still record for future confirmation counts
             active.setdefault(key, []).append((t, trader))
             continue
 
@@ -147,8 +147,8 @@ def extract_confirmed_signals(
                 "trigger_usd":          float(row.usd_amount),
                 "confirming_whales":    len(all_whales),
                 "whale_addresses":      ",".join(sorted(all_whales)),
-                "market_liquidity_usd": float(row._liq),
-                "price_impact_pct":     round(float(row._impact) * 100, 3),
+                "market_liquidity_usd": float(row.xliq),
+                "price_impact_pct":     round(float(row.ximpact) * 100, 3),
             })
             last_signal[key] = t
             # Reset the active window so next confirmation starts fresh
