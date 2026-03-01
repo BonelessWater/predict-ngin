@@ -62,6 +62,7 @@ from src.whale_strategy.whale_surprise import (
     build_surprise_positive_whale_set,
 )
 from src.whale_strategy.confirmed_signals import extract_confirmed_signals
+from src.trading.reporting import generate_quantstats_report
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +388,8 @@ def main() -> int:
 
     parser.add_argument("--output",  default=str(_project_root / "data" / "output" / "confirmed_whale.csv"))
     parser.add_argument("--report",  default=str(_project_root / "data" / "output" / "confirmed_whale.html"))
+    parser.add_argument("--quantstats", default=str(_project_root / "data" / "output" / "confirmed_whale_qs.html"),
+                        help="Path for QuantStats HTML report")
     args = parser.parse_args()
 
     categories = (
@@ -542,7 +545,7 @@ def main() -> int:
     trades_result.to_csv(args.output, index=False)
     print(f"\n  Trades CSV : {args.output}")
 
-    # ── HTML report ───────────────────────────────────────────────────────────
+    # ── Custom HTML report ────────────────────────────────────────────────────
     print("  Building report...")
     build_report(
         metrics=metrics,
@@ -550,6 +553,22 @@ def main() -> int:
         pipeline_params=pipeline_params,
         output_path=args.report,
     )
+
+    # ── QuantStats HTML report ────────────────────────────────────────────────
+    dr = metrics.get("daily_returns")
+    if dr is not None and len(dr) >= 5:
+        print("  Building QuantStats report...")
+        ok = generate_quantstats_report(
+            dr,
+            args.quantstats,
+            title="Confirmed Whale Strategy",
+        )
+        if ok:
+            print(f"  QuantStats  : {args.quantstats}")
+        else:
+            print("  QuantStats  : skipped (install quantstats to enable)")
+    else:
+        print("  QuantStats  : skipped (not enough daily return data)")
 
     return 0
 
