@@ -15,7 +15,10 @@ Usage:
 """
 
 import argparse
+import os
 import sys
+import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 _project_root = Path(__file__).resolve().parent.parent.parent
@@ -53,6 +56,74 @@ from src.whale_strategy.whale_surprise import (
 )
 from trading.data_modules.costs import CostModel, DEFAULT_COST_MODEL
 from trading.reporting import generate_quantstats_report
+
+
+def _monthly_whale_worker(args):
+    """Top-level worker: build surprise-positive whale set for one month.
+
+    Reads trades from a temp parquet path so the large DataFrame is not
+    serialized over pickle — the OS page cache makes re-reads fast.
+    """
+    (year, month, cutoff_str, trades_parquet_path, resolution_winners,
+     min_surprise, min_trades_for_surprise, min_whale_wr,
+     require_positive_surprise, volume_percentile) = args
+
+    from src.whale_strategy.whale_surprise import build_surprise_positive_whale_set
+
+    trades = pd.read_parquet(trades_parquet_path)
+    cutoff = pd.Timestamp(cutoff_str)
+    hist_df = trades[trades["datetime"] <= cutoff]
+    if len(hist_df) < 1000:
+        return (year, month), (set(), {}, {})
+
+    w, s, wr = build_surprise_positive_whale_set(
+        hist_df,
+        resolution_winners,
+        min_surprise=min_surprise,
+        min_trades=min_trades_for_surprise,
+        min_actual_win_rate=min_whale_wr,
+        require_positive_surprise=require_positive_surprise,
+        volume_percentile=volume_percentile,
+    )
+    return (year, month), (w, s, wr)
+
+
+def _category_backtest_worker(args):
+    """Top-level worker: run whale backtest for a single category."""
+    (cat, research_dir_str, capital, min_usd, position_size, train_ratio,
+     start_date, end_date, db_path,
+     mode, volume_percentile, unfavored_only, unfavored_max_price,
+     min_surprise, min_trades_for_surprise, min_whale_wr, require_positive_surprise,
+     rebalance_freq) = args
+
+    whale_config = WhaleConfig(
+        mode=mode,
+        volume_percentile=volume_percentile,
+        unfavored_only=unfavored_only,
+        unfavored_max_price=unfavored_max_price,
+        min_surprise=min_surprise,
+        min_trades_for_surprise=min_trades_for_surprise,
+        min_whale_wr=min_whale_wr,
+        require_positive_surprise=require_positive_surprise,
+    )
+    result = run_whale_category_backtest(
+        research_dir=Path(research_dir_str),
+        capital=capital,
+        min_usd=min_usd,
+        position_size=position_size,
+        train_ratio=train_ratio,
+        start_date=start_date,
+        end_date=end_date,
+        categories=[cat],
+        db_path=db_path,
+        whale_config=whale_config,
+        surprise_only=whale_config.surprise_only,
+        volume_only=whale_config.volume_only,
+        unfavored_only=unfavored_only,
+        rebalance_freq=rebalance_freq,
+        n_workers=1,
+    )
+    return cat, result
 
 
 def _to_datetime_safe(value) -> pd.Timestamp:
@@ -130,6 +201,7 @@ def run_whale_category_backtest(
     unfavored_only: bool = None,
     unfavored_max_price: float = None,
     rebalance_freq: str = "1M",
+    n_workers: int = 1,
 ) -> dict:
     """
     Run whale-following backtest with category limits.
@@ -185,24 +257,47 @@ def run_whale_category_backtest(
     if use_performance_filter and rebalance_freq:
         # Rolling monthly: re-identify whales at start of each month from data up to end of previous month
         test_months = test_df["datetime"].dt.to_period("M").unique()
-        for period in sorted(test_months):
-            ym = (period.year, period.month)
-            cutoff = period.to_timestamp(how="start") - pd.Timedelta(days=1)  # End of previous month
-            hist_df = trades_df[trades_df["datetime"] <= cutoff]
-            if len(hist_df) < 1000:
-                monthly_whale_sets[ym] = (set(), {}, {})
-                continue
-            w, s, wr = build_surprise_positive_whale_set(
-                hist_df,
-                resolution_winners,
-                min_surprise=cfg.min_surprise,
-                min_trades=cfg.min_trades_for_surprise,
-                min_actual_win_rate=cfg.min_whale_wr,
-                require_positive_surprise=cfg.require_positive_surprise,
-                volume_percentile=cfg.volume_percentile,
-            )
-            monthly_whale_sets[ym] = (w, s, wr)
-            whales |= w
+        if n_workers > 1 and len(test_months) > 1:
+            # Write trades to temp parquet so workers load from disk (no pickle of large DataFrame)
+            _tmp_fd, _tmp_path = tempfile.mkstemp(suffix=".parquet")
+            os.close(_tmp_fd)
+            try:
+                trades_df.to_parquet(_tmp_path)
+                month_args = [
+                    (p.year, p.month,
+                     str(p.to_timestamp(how="start") - pd.Timedelta(days=1)),
+                     _tmp_path, resolution_winners,
+                     cfg.min_surprise, cfg.min_trades_for_surprise, cfg.min_whale_wr,
+                     cfg.require_positive_surprise, cfg.volume_percentile)
+                    for p in sorted(test_months)
+                ]
+                n_month_workers = min(n_workers, len(month_args))
+                print(f"  Parallel monthly whale sets: {len(month_args)} months, {n_month_workers} workers")
+                with ProcessPoolExecutor(max_workers=n_month_workers) as pool:
+                    for ym, whale_data in pool.map(_monthly_whale_worker, month_args):
+                        monthly_whale_sets[ym] = whale_data
+                        whales |= whale_data[0]
+            finally:
+                Path(_tmp_path).unlink(missing_ok=True)
+        else:
+            for period in sorted(test_months):
+                ym = (period.year, period.month)
+                cutoff = period.to_timestamp(how="start") - pd.Timedelta(days=1)  # End of previous month
+                hist_df = trades_df[trades_df["datetime"] <= cutoff]
+                if len(hist_df) < 1000:
+                    monthly_whale_sets[ym] = (set(), {}, {})
+                    continue
+                w, s, wr = build_surprise_positive_whale_set(
+                    hist_df,
+                    resolution_winners,
+                    min_surprise=cfg.min_surprise,
+                    min_trades=cfg.min_trades_for_surprise,
+                    min_actual_win_rate=cfg.min_whale_wr,
+                    require_positive_surprise=cfg.require_positive_surprise,
+                    volume_percentile=cfg.volume_percentile,
+                )
+                monthly_whale_sets[ym] = (w, s, wr)
+                whales |= w
         if whales:
             # Merge scores/winrates from latest month (or first non-empty)
             for ym in reversed(sorted(monthly_whale_sets.keys())):
@@ -578,6 +673,10 @@ def main() -> int:
     parser.add_argument("--no-tracker", action="store_true", help="Skip experiment tracker (experiments.db)")
     parser.add_argument("--backtests-dir", type=Path, default=_project_root / "backtests", help="Directory for backtest storage and experiments.db")
     parser.add_argument("--no-rebalance", action="store_true", help="Disable monthly whale rebalancing (use single train-period whale set)")
+    parser.add_argument(
+        "--workers", type=int, default=os.cpu_count() or 1,
+        help="Parallel workers: per-category mode distributes categories; combined mode parallelises monthly whale building (default: all CPUs)",
+    )
     args = parser.parse_args()
 
     research_dir = args.research_dir
@@ -630,6 +729,7 @@ def main() -> int:
     print("  volume_only  ", volume_only)
     print("  unfavored_only", unfavored_only)
     print("  categories   ", categories or "all")
+    print("  workers      ", args.workers)
 
     if args.mode == "per-category":
         # Run each category separately
@@ -642,38 +742,16 @@ def main() -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
         all_results = []
 
-        for cat in cats_to_run:
-            print(f"\n--- Category: {cat} ---")
-            result = run_whale_category_backtest(
-                research_dir=research_dir,
-                capital=args.capital,
-                min_usd=args.min_usd,
-                position_size=args.position_size,
-                train_ratio=args.train_ratio,
-                start_date=args.start_date,
-                end_date=args.end_date,
-                categories=[cat],
-                db_path=args.db_path,
-                whale_config=whale_config,
-                surprise_only=surprise_only,
-                volume_only=volume_only,
-                unfavored_only=unfavored_only,
-                rebalance_freq="1M" if not args.no_rebalance else None,
-            )
+        def _save_cat_result(cat, result):
             if "error" in result:
-                print(f"  Error: {result['error']}")
-                continue
-
-            all_results.append((cat, result))
+                print(f"  {cat}: Error: {result['error']}")
+                return None
             cat_out = output_dir / cat.replace(" ", "_")
             cat_out.mkdir(parents=True, exist_ok=True)
-
-            print(f"  Trades: {result['total_trades']:,}  Win%: {result['win_rate']*100:.1f}  "
-                  f"P&L: ${result['total_net_pnl']:,.0f}  ROI: {result['roi_pct']:.1f}%")
-
+            print(f"  {cat}: Trades={result['total_trades']:,}  Win%={result['win_rate']*100:.1f}  "
+                  f"P&L=${result['total_net_pnl']:,.0f}  ROI={result['roi_pct']:.1f}%")
             if "trades_df" in result:
                 result["trades_df"].to_csv(cat_out / "whale_backtest_trades.csv", index=False)
-
             if not args.no_quantstats and "daily_returns" in result and len(result["daily_returns"]) >= 5:
                 ok = generate_quantstats_report(
                     result["daily_returns"],
@@ -682,6 +760,55 @@ def main() -> int:
                 )
                 if ok:
                     print(f"  QuantStats: {cat_out / 'quantstats_whale_following.html'}")
+            return (cat, result)
+
+        n_cat_workers = min(args.workers, len(cats_to_run))
+        if n_cat_workers > 1:
+            print(f"Running {len(cats_to_run)} categories in parallel ({n_cat_workers} workers)...")
+            worker_args_list = [
+                (cat, str(research_dir), args.capital, args.min_usd, args.position_size,
+                 args.train_ratio, args.start_date, args.end_date, args.db_path,
+                 whale_config.mode, whale_config.volume_percentile,
+                 whale_config.unfavored_only, whale_config.unfavored_max_price,
+                 whale_config.min_surprise, whale_config.min_trades_for_surprise,
+                 whale_config.min_whale_wr, whale_config.require_positive_surprise,
+                 "1M" if not args.no_rebalance else None)
+                for cat in cats_to_run
+            ]
+            with ProcessPoolExecutor(max_workers=n_cat_workers) as pool:
+                futures = {pool.submit(_category_backtest_worker, wa): wa[0] for wa in worker_args_list}
+                for future in as_completed(futures):
+                    cat = futures[future]
+                    try:
+                        cat, result = future.result()
+                        r = _save_cat_result(cat, result)
+                        if r:
+                            all_results.append(r)
+                    except Exception as exc:
+                        print(f"  {cat}: Exception: {exc}")
+        else:
+            for cat in cats_to_run:
+                print(f"\n--- Category: {cat} ---")
+                result = run_whale_category_backtest(
+                    research_dir=research_dir,
+                    capital=args.capital,
+                    min_usd=args.min_usd,
+                    position_size=args.position_size,
+                    train_ratio=args.train_ratio,
+                    start_date=args.start_date,
+                    end_date=args.end_date,
+                    categories=[cat],
+                    db_path=args.db_path,
+                    whale_config=whale_config,
+                    surprise_only=surprise_only,
+                    volume_only=volume_only,
+                    unfavored_only=unfavored_only,
+                    rebalance_freq="1M" if not args.no_rebalance else None,
+                    n_workers=1,
+                )
+                r = _save_cat_result(cat, result)
+                if r:
+                    all_results.append(r)
 
         if not all_results:
             return 1
@@ -710,6 +837,7 @@ def main() -> int:
         volume_only=volume_only,
         unfavored_only=unfavored_only,
         rebalance_freq="1M" if not args.no_rebalance else None,
+        n_workers=args.workers,
     )
 
     if "error" in result:
