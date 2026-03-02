@@ -151,6 +151,8 @@ def main() -> int:
     parser.add_argument("--prices-only", action="store_true", help="Only fetch prices")
     parser.add_argument("--price-interval", type=str, default="1h", choices=["1m", "1h", "6h", "1d", "1w", "max"], help="Price series interval")
     parser.add_argument("--delay", type=float, default=REQUEST_DELAY, help="Delay between API calls (seconds)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip markets already present in existing trades/prices parquet (resume interrupted run)")
     args = parser.parse_args()
 
     categories_filter = [c.strip() for c in args.categories.split(",")] if args.categories else None
@@ -176,12 +178,35 @@ def main() -> int:
         n_markets = len(df)
         print(f"\n[{cat_name}] {n_markets} markets")
 
+        # Build sets of already-fetched market IDs for resume mode
+        done_trade_ids: set = set()
+        done_price_ids: set = set()
+        if args.resume:
+            trades_path = out_dir / "trades.parquet"
+            if trades_path.exists():
+                try:
+                    existing = pd.read_parquet(trades_path, columns=["market_id"])
+                    done_trade_ids = set(existing["market_id"].dropna().astype(str).unique())
+                    print(f"  Resume trades: {len(done_trade_ids):,} markets already fetched, skipping")
+                except Exception as e:
+                    print(f"  Resume trades: could not read existing parquet ({e}), fetching all")
+            prices_path = out_dir / "prices.parquet"
+            if prices_path.exists():
+                try:
+                    existing = pd.read_parquet(prices_path, columns=["market_id"])
+                    done_price_ids = set(existing["market_id"].dropna().astype(str).unique())
+                    print(f"  Resume prices: {len(done_price_ids):,} markets already fetched, skipping")
+                except Exception as e:
+                    print(f"  Resume prices: could not read existing parquet ({e}), fetching all")
+
         if do_trades:
             all_trades: List[Dict[str, Any]] = []
             flush_every = 100
             for i, row in df.iterrows():
                 cid = str(row.get("conditionId", "")).strip()
                 if not cid or not cid.startswith("0x"):
+                    continue
+                if args.resume and cid in done_trade_ids:
                     continue
                 trades = fetch_trades_for_market(cid, session)
                 all_trades.extend(trades)
@@ -244,6 +269,8 @@ def main() -> int:
             price_rows: List[Dict[str, Any]] = []
             for i, row in df.iterrows():
                 cid = str(row.get("conditionId", "")).strip()
+                if args.resume and cid in done_price_ids:
+                    continue
                 tokens = _parse_clob_token_ids(row.get("clobTokenIds"))
                 # First token is typically YES outcome
                 token_id = tokens[0] if tokens else None
@@ -264,6 +291,10 @@ def main() -> int:
             if price_rows:
                 price_df = pd.DataFrame(price_rows)
                 out_path = out_dir / "prices.parquet"
+                if out_path.exists() and args.resume:
+                    existing_prices = pd.read_parquet(out_path)
+                    price_df = pd.concat([existing_prices, price_df], ignore_index=True)
+                    price_df = price_df.drop_duplicates(subset=["market_id", "timestamp"], keep="first")
                 price_df.to_parquet(out_path, index=False)
                 print(f"  Wrote {len(price_df):,} price rows -> {out_path}")
             else:
