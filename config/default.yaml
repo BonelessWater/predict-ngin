@@ -84,6 +84,18 @@ whale_strategy:
   # Signal generation
   min_signal_usd: 100
 
+  # Entry price bounds: exclude dust markets where implied payout < $0.02/dollar.
+  # Symmetric thresholds derived from economic viability, not backtest performance.
+  min_entry_yes_price: 0.02
+  max_entry_yes_price: 0.98
+
+  # Multi-whale confirmation (1 = disabled)
+  min_confirmation_whales: 1
+  confirmation_window_days: 7
+
+  # Max hold days before force-closing at CLOB price (0 = disabled)
+  max_hold_days: 0
+
 # =============================================================================
 # STRATEGIES
 # =============================================================================

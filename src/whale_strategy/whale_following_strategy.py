@@ -17,6 +17,7 @@ import pandas as pd
 
 from .whale_scoring import (
     calculate_whale_score,
+    calculate_performance_score,
     qualifies_as_whale_signal,
     WHALE_CRITERIA,
     MIN_WHALE_SCORE,
@@ -287,17 +288,15 @@ def filter_and_score_signals(
         if filtered.empty:
             return []
 
-    # --- Assign scores (vectorized when override provided) ---
-    if whale_scores_override is not None:
-        filtered["_score"] = filtered[trader_col].map(whale_scores_override).fillna(0.0)
-    else:
-        filtered["_score"] = filtered.apply(
-            lambda row: calculate_whale_score(
-                row, trades_df, resolution_winners,
-                market_meta.get(row["_mid"], {}), role,
-            ),
-            axis=1,
-        )
+    # --- Assign scores (vectorized) ---
+    if whale_scores_override is None:
+        unique_whales = filtered[trader_col].unique()
+        whale_scores_override = {
+            whale: calculate_performance_score(whale, trades_df, resolution_winners, role)
+            for whale in unique_whales
+        }
+
+    filtered["_score"] = filtered[trader_col].map(whale_scores_override).fillna(0.0)
 
     filtered = filtered[filtered["_score"] >= MIN_WHALE_SCORE]
     if filtered.empty:

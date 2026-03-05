@@ -50,6 +50,21 @@ class WhaleConfig:
     min_trades: int = 10
     min_volume: float = 1000.0
 
+    # Entry price bounds: exclude near-resolved markets.
+    # At YES < 0.02 or YES > 0.98, the implied payout on the losing-side token
+    # is under $0.02 per dollar — economically unviable regardless of whale conviction.
+    # These are symmetric dust-exclusion thresholds, NOT calibrated to backtest PnL.
+    min_entry_yes_price: float = 0.02
+    max_entry_yes_price: float = 0.98
+
+    # Multi-whale confirmation gate (1 = disabled)
+    min_confirmation_whales: int = 1
+    confirmation_window_days: int = 7
+
+    # Max calendar days to hold before force-close at CLOB (0 = off).
+    # Portfolio management preference — not derived from signal logic.
+    max_hold_days: int = 0
+
     @property
     def volume_only(self) -> bool:
         return self.mode == "volume_only"
@@ -108,6 +123,16 @@ def load_whale_config(config_path: Optional[Path] = None) -> WhaleConfig:
             cfg.min_trades = int(ws["min_trades"])
         if "min_volume" in ws:
             cfg.min_volume = float(ws["min_volume"])
+        if "min_entry_yes_price" in ws:
+            cfg.min_entry_yes_price = float(ws["min_entry_yes_price"])
+        if "max_entry_yes_price" in ws:
+            cfg.max_entry_yes_price = float(ws["max_entry_yes_price"])
+        if "min_confirmation_whales" in ws:
+            cfg.min_confirmation_whales = int(ws["min_confirmation_whales"])
+        if "confirmation_window_days" in ws:
+            cfg.confirmation_window_days = int(ws["confirmation_window_days"])
+        if "max_hold_days" in ws:
+            cfg.max_hold_days = int(ws["max_hold_days"])
         if "min_usd" in ws:
             cfg.min_usd = float(ws["min_usd"])
         if "min_whale_wr" in ws:

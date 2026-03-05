@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import dataclasses
 import os
 import sys
 import tempfile
@@ -91,21 +92,9 @@ def _monthly_whale_worker(args):
 def _category_backtest_worker(args):
     """Top-level worker: run whale backtest for a single category."""
     (cat, research_dir_str, capital, min_usd, position_size, train_ratio,
-     start_date, end_date, db_path,
-     mode, volume_percentile, unfavored_only, unfavored_max_price,
-     min_surprise, min_trades_for_surprise, min_whale_wr, require_positive_surprise,
-     rebalance_freq) = args
+     start_date, end_date, db_path, whale_config_dict, rebalance_freq) = args
 
-    whale_config = WhaleConfig(
-        mode=mode,
-        volume_percentile=volume_percentile,
-        unfavored_only=unfavored_only,
-        unfavored_max_price=unfavored_max_price,
-        min_surprise=min_surprise,
-        min_trades_for_surprise=min_trades_for_surprise,
-        min_whale_wr=min_whale_wr,
-        require_positive_surprise=require_positive_surprise,
-    )
+    whale_config = WhaleConfig(**whale_config_dict)
     result = run_whale_category_backtest(
         research_dir=Path(research_dir_str),
         capital=capital,
@@ -298,14 +287,6 @@ def run_whale_category_backtest(
                 )
                 monthly_whale_sets[ym] = (w, s, wr)
                 whales |= w
-        if whales:
-            # Merge scores/winrates from latest month (or first non-empty)
-            for ym in reversed(sorted(monthly_whale_sets.keys())):
-                w, s, wr = monthly_whale_sets[ym]
-                if s:
-                    whale_scores_override = s
-                    whale_winrates_override = wr
-                    break
         print(f"  Rolling monthly: {len(whales)} qualified whales (WR>={cfg.min_whale_wr*100:.0f}%, surprise>0) across {len(monthly_whale_sets)} months")
     elif use_performance_filter and resolution_winners:
         # Single train-period whale set with performance filter
@@ -435,10 +416,21 @@ def run_whale_category_backtest(
     signals_sorted = sorted(signals, key=lambda s: s.datetime)
     test_dates = sorted(set(s.datetime.normalize() for s in signals_sorted))
 
+    # Precompute signal history for multi-whale confirmation
+    from collections import defaultdict
+    signal_history: dict = defaultdict(list)
+    for _sig in signals_sorted:
+        signal_history[(_sig.market_id, _sig.side)].append((_sig.datetime, _sig.whale_address))
+
     for current_date in test_dates:
         # 1. Close positions that resolve
         to_close = []
         for mid, pos in open_positions.items():
+            if cfg.max_hold_days > 0:
+                hold_days = (current_date.date() - pos.entry_date.date()).days
+                if hold_days >= cfg.max_hold_days:
+                    to_close.append((mid, "max_hold", None))
+                    continue
             res = resolutions.get(mid, {})
             res_date = res.get("resolution_date")
             if res_date and pd.to_datetime(res_date).date() <= current_date.date():
@@ -469,8 +461,9 @@ def run_whale_category_backtest(
                 # BUY YES: shares = size_usd/entry_price, PnL = (exit - entry) * shares
                 gross_pnl = (exit_price - pos.entry_price) * (pos.size_usd / pos.entry_price)
             else:
-                # SELL NO: shares = size_usd/entry_price (entry = NO price), PnL = (entry - exit) * shares
-                gross_pnl = (pos.entry_price - exit_price) * (pos.size_usd / pos.entry_price)
+                # SELL: entered by buying NO at (1 - YES_entry_price). exit_price already = NO payout.
+                entry_no = 1.0 - pos.entry_price
+                gross_pnl = (exit_price - entry_no) * (pos.size_usd / max(entry_no, 1e-6))
 
             net_pnl = gross_pnl * 0.97  # Cost estimate
             closed_trades.append({
@@ -496,12 +489,16 @@ def run_whale_category_backtest(
         # 2. Process signals for today
         today_signals = [s for s in signals_sorted if s.datetime.normalize() == current_date]
         for sig in today_signals:
-            # Rolling: only follow if whale is in active set for this month
+            # Rolling: only follow if whale is in active set for this month; use per-month scores
             if monthly_whale_sets:
                 ym = (sig.datetime.year, sig.datetime.month)
-                active_whales, _, _ = monthly_whale_sets.get(ym, (set(), {}, {}))
+                active_whales, active_scores, active_winrates = monthly_whale_sets.get(ym, (set(), {}, {}))
                 if sig.whale_address not in active_whales:
                     continue
+                if active_scores:
+                    sig.score = active_scores.get(sig.whale_address, sig.score)
+                if active_winrates:
+                    sig.historical_winrate = active_winrates.get(sig.whale_address, sig.historical_winrate)
             mid = sig.market_id
             if mid in open_positions:
                 pos = open_positions[mid]
@@ -515,7 +512,8 @@ def run_whale_category_backtest(
                         gross = (exit_price - pos.entry_price) * (pos.size_usd / pos.entry_price)
                     else:
                         exit_price = 1.0 - clob_price  # NO price
-                        gross = (pos.entry_price - exit_price) * (pos.size_usd / pos.entry_price)
+                        entry_no = 1.0 - pos.entry_price
+                        gross = (exit_price - entry_no) * (pos.size_usd / max(entry_no, 1e-6))
                     closed_trades.append({
                         "market_id": mid, "entry_date": pos.entry_date, "exit_date": current_date,
                         "direction": pos.side, "entry_price": pos.entry_price, "exit_price": exit_price,
@@ -537,6 +535,20 @@ def run_whale_category_backtest(
             res = resolutions.get(mid, {})
             if res.get("resolution_date") and pd.to_datetime(res["resolution_date"]).date() <= current_date.date():
                 continue
+
+            # Entry price bounds: skip near-certain markets
+            if not (cfg.min_entry_yes_price <= sig.price <= cfg.max_entry_yes_price):
+                continue
+
+            # Multi-whale confirmation
+            if cfg.min_confirmation_whales > 1:
+                window_start = sig.datetime - pd.Timedelta(days=cfg.confirmation_window_days)
+                recent_whales = {
+                    w for dt, w in signal_history[(sig.market_id, sig.side)]
+                    if window_start <= dt <= sig.datetime
+                }
+                if len(recent_whales) < cfg.min_confirmation_whales:
+                    continue
 
             size = calculate_position_size(sig, state, market_liquidity.get(mid, 100_000))
             if size is None or size < 1000:
@@ -574,7 +586,8 @@ def run_whale_category_backtest(
                 gross = (exit_price - pos.entry_price) * (pos.size_usd / pos.entry_price)
             else:
                 exit_price = 1.0 - clob_price  # NO price
-                gross = (pos.entry_price - exit_price) * (pos.size_usd / pos.entry_price)
+                entry_no = 1.0 - pos.entry_price
+                gross = (exit_price - entry_no) * (pos.size_usd / max(entry_no, 1e-6))
             closed_trades.append({
                 "market_id": mid, "entry_date": pos.entry_date, "exit_date": last_date,
                 "direction": pos.side, "entry_price": pos.entry_price, "exit_price": exit_price,
@@ -602,11 +615,35 @@ def run_whale_category_backtest(
     equity = capital + cumulative_pnl
     daily_returns = equity.pct_change().dropna()
 
+    wins_pnl = df.loc[df["net_pnl"] > 0, "net_pnl"]
+    losses_pnl = df.loc[df["net_pnl"] <= 0, "net_pnl"]
+    avg_win = float(wins_pnl.mean()) if len(wins_pnl) else 0.0
+    avg_loss = float(losses_pnl.mean()) if len(losses_pnl) else 0.0
+    profit_factor = (wins_pnl.sum() / abs(losses_pnl.sum())) if losses_pnl.sum() != 0 else float("inf")
+
+    sharpe = 0.0
+    if len(daily_returns) >= 5 and daily_returns.std() > 0:
+        sharpe = float((daily_returns.mean() / daily_returns.std()) * (252 ** 0.5))
+
+    max_dd = 0.0
+    peak = capital
+    for v in equity:
+        if v > peak:
+            peak = v
+        dd = (peak - v) / peak
+        if dd > max_dd:
+            max_dd = dd
+
     return {
         "total_trades": total,
         "win_rate": wins / total if total else 0,
         "total_net_pnl": total_pnl,
         "roi_pct": (total_pnl / capital) * 100,
+        "sharpe_ratio": sharpe,
+        "max_drawdown_pct": max_dd * 100,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "profit_factor": profit_factor,
         "whales_followed": len(whales),
         "signals_processed": len(signals),
         "categories": categories,
@@ -614,6 +651,125 @@ def run_whale_category_backtest(
         "daily_returns": daily_returns,
         "daily_equity": equity,
     }
+
+
+# One-at-a-time sensitivity grids for each tuneable parameter.
+# Values span a wide range so we can see the full response curve, not just the optimum.
+SENSITIVITY_GRIDS: dict = {
+    "max_entry_yes_price": [0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.98, 1.00],
+    "min_entry_yes_price": [0.00, 0.01, 0.02, 0.05, 0.08, 0.10, 0.15],
+    "min_confirmation_whales": [1, 2, 3, 4],
+    "confirmation_window_days": [3, 7, 14, 21, 30],
+    "max_hold_days": [0, 30, 60, 90, 180],
+}
+
+
+def run_sensitivity_test(
+    research_dir: Path,
+    capital: float,
+    categories: list,
+    db_path: str,
+    whale_config_base: WhaleConfig,
+    n_workers: int,
+    output_dir: Path,
+    params_to_test: list = None,
+) -> pd.DataFrame:
+    """
+    One-at-a-time (OAT) parameter sensitivity test.
+
+    Varies each parameter independently across a principled grid while holding all
+    others at their base values in whale_config_base.  Purpose: detect p-hacking.
+
+    A robust parameter shows a monotone or smooth response in profit factor.
+    A non-monotone spike at a single value strongly suggests the parameter was
+    cherry-picked to fit the test set and will not generalise.
+
+    This is diagnostic only — do NOT use the output to re-select parameter values.
+    """
+    import copy
+
+    grids = {
+        k: v for k, v in SENSITIVITY_GRIDS.items()
+        if params_to_test is None or k in params_to_test
+    }
+
+    all_rows = []
+
+    print("\n" + "=" * 72)
+    print("PARAMETER SENSITIVITY TEST  (one-at-a-time)")
+    print("Diagnostic only — do NOT re-select values based on this output.")
+    print("Robust: monotone response.  Suspect: single-value spike.")
+    print("=" * 72)
+
+    for param, values in grids.items():
+        default_val = getattr(whale_config_base, param)
+        print(f"\n--- {param}  (current={default_val}) ---")
+        print(f"{'Value':>8}  {'Trades':>7}  {'Win%':>6}  {'PF':>6}  {'Sharpe':>7}  {'NetPnL':>12}")
+
+        param_results = []
+        for v in values:
+            cfg = copy.deepcopy(whale_config_base)
+            setattr(cfg, param, v)
+            result = run_whale_category_backtest(
+                research_dir=research_dir,
+                capital=capital,
+                categories=categories,
+                db_path=db_path,
+                whale_config=cfg,
+                rebalance_freq="1M",
+                n_workers=n_workers,
+            )
+            marker = " <-- current" if v == default_val else ""
+            if "error" in result:
+                print(f"{v:>8}  {'ERROR':>7}  {result['error']}{marker}")
+                all_rows.append({"parameter": param, "value": v, "error": result["error"]})
+                param_results.append(None)
+                continue
+
+            t = result["total_trades"]
+            wr = result["win_rate"] * 100
+            pf = min(result["profit_factor"], 99.0)  # cap inf for display
+            sh = result["sharpe_ratio"]
+            pnl = result["total_net_pnl"]
+            print(f"{v:>8}  {t:>7,}  {wr:>5.1f}%  {pf:>6.2f}  {sh:>7.2f}  ${pnl:>11,.0f}{marker}")
+            row = {
+                "parameter": param, "value": v,
+                "total_trades": t, "win_rate_pct": wr,
+                "profit_factor": pf, "sharpe": sh, "net_pnl": pnl,
+            }
+            all_rows.append(row)
+            param_results.append(pf)
+
+        # Monotonicity verdict on profit factor
+        valid = [(v, pf) for v, pf in zip(values, param_results) if pf is not None]
+        if len(valid) >= 3:
+            pf_vals = [x[1] for x in valid]
+            ascending  = all(pf_vals[i] <= pf_vals[i + 1] for i in range(len(pf_vals) - 1))
+            descending = all(pf_vals[i] >= pf_vals[i + 1] for i in range(len(pf_vals) - 1))
+            pf_range = max(pf_vals) - min(pf_vals)
+            peak_idx = int(np.argmax(pf_vals))
+            at_boundary = peak_idx == 0 or peak_idx == len(pf_vals) - 1
+
+            if pf_range < 0.05:
+                verdict = "FLAT — parameter has negligible effect; consider removing it"
+            elif ascending or descending:
+                verdict = "MONOTONE — robust directional relationship, not cherry-picked"
+            elif at_boundary:
+                verdict = "MONOTONE-LIKE — peak at boundary; effectively monotone over this range"
+            else:
+                peak_val = valid[peak_idx][0]
+                verdict = (
+                    f"NON-MONOTONE — profit factor peaks at {peak_val} then declines. "
+                    f"Verify this value was chosen from first principles, NOT from this output."
+                )
+            print(f"  Verdict: {verdict}")
+
+    df = pd.DataFrame(all_rows)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / "sensitivity_test.csv"
+    df.to_csv(out_path, index=False)
+    print(f"\nSensitivity results saved to {out_path}")
+    return df
 
 
 def main() -> int:
@@ -673,8 +829,25 @@ def main() -> int:
     parser.add_argument("--no-tracker", action="store_true", help="Skip experiment tracker (experiments.db)")
     parser.add_argument("--backtests-dir", type=Path, default=_project_root / "backtests", help="Directory for backtest storage and experiments.db")
     parser.add_argument("--no-rebalance", action="store_true", help="Disable monthly whale rebalancing (use single train-period whale set)")
+    parser.add_argument("--min-entry-price", type=float, default=None, help="Min YES price for entry (default 0.05)")
+    parser.add_argument("--max-entry-price", type=float, default=None, help="Max YES price for entry (default 0.87)")
+    parser.add_argument("--min-confirmation-whales", type=int, default=None, help="Distinct whales required to confirm signal (default 1)")
+    parser.add_argument("--confirmation-window-days", type=int, default=None, help="Rolling window for confirmation (default 7)")
+    parser.add_argument("--max-hold-days", type=int, default=None, help="Force-close positions after N days (default 0=off)")
     parser.add_argument(
-        "--workers", type=int, default=os.cpu_count() or 1,
+        "--sensitivity",
+        action="store_true",
+        help="Run one-at-a-time parameter sensitivity test to detect p-hacking",
+    )
+    parser.add_argument(
+        "--sensitivity-params",
+        default=None,
+        help="Comma-separated parameters to test (default: all). "
+             "Options: max_entry_yes_price, min_entry_yes_price, "
+             "min_confirmation_whales, confirmation_window_days, max_hold_days",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=35,
         help="Parallel workers: per-category mode distributes categories; combined mode parallelises monthly whale building (default: all CPUs)",
     )
     args = parser.parse_args()
@@ -711,6 +884,16 @@ def main() -> int:
         whale_config.mode = "volume_only"
     if args.surprise_only:
         whale_config.mode = "surprise_only"
+    if args.min_entry_price is not None:
+        whale_config.min_entry_yes_price = args.min_entry_price
+    if args.max_entry_price is not None:
+        whale_config.max_entry_yes_price = args.max_entry_price
+    if args.min_confirmation_whales is not None:
+        whale_config.min_confirmation_whales = args.min_confirmation_whales
+    if args.confirmation_window_days is not None:
+        whale_config.confirmation_window_days = args.confirmation_window_days
+    if args.max_hold_days is not None:
+        whale_config.max_hold_days = args.max_hold_days
     surprise_only = whale_config.surprise_only
     volume_only = whale_config.volume_only
     unfavored_only = whale_config.unfavored_only
@@ -730,6 +913,23 @@ def main() -> int:
     print("  unfavored_only", unfavored_only)
     print("  categories   ", categories or "all")
     print("  workers      ", args.workers)
+
+    # Sensitivity test mode — runs before (and instead of) the main backtest
+    if args.sensitivity:
+        params_to_test = None
+        if args.sensitivity_params:
+            params_to_test = [p.strip() for p in args.sensitivity_params.split(",")]
+        run_sensitivity_test(
+            research_dir=research_dir,
+            capital=args.capital,
+            categories=categories,
+            db_path=args.db_path,
+            whale_config_base=whale_config,
+            n_workers=args.workers,
+            output_dir=args.output_dir,
+            params_to_test=params_to_test,
+        )
+        return 0
 
     if args.mode == "per-category":
         # Run each category separately
@@ -768,10 +968,7 @@ def main() -> int:
             worker_args_list = [
                 (cat, str(research_dir), args.capital, args.min_usd, args.position_size,
                  args.train_ratio, args.start_date, args.end_date, args.db_path,
-                 whale_config.mode, whale_config.volume_percentile,
-                 whale_config.unfavored_only, whale_config.unfavored_max_price,
-                 whale_config.min_surprise, whale_config.min_trades_for_surprise,
-                 whale_config.min_whale_wr, whale_config.require_positive_surprise,
+                 dataclasses.asdict(whale_config),
                  "1M" if not args.no_rebalance else None)
                 for cat in cats_to_run
             ]
