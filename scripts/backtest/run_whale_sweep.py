@@ -40,7 +40,6 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 FULL_GRID = {
-    "min_whale_wr":              [0.50, 0.55, 0.60, 0.65],
     "min_surprise":              [0.0, 0.02, 0.05],
     "volume_percentile":         [85.0, 90.0, 95.0],
     "train_ratio":               [0.3, 0.5, 0.7],
@@ -48,7 +47,6 @@ FULL_GRID = {
 }
 
 QUICK_GRID = {
-    "min_whale_wr":              [0.50, 0.60],
     "min_surprise":              [0.0, 0.05],
     "volume_percentile":         [90.0, 95.0],
     "train_ratio":               [0.3],
@@ -64,7 +62,7 @@ def _sweep_worker(args):
     """Run one whale backtest configuration. Returns (params_dict, metrics_dict, error_str)."""
     (project_root_str, research_dir_str, capital, min_usd, position_size,
      start_date, end_date, categories_list,
-     min_whale_wr, min_surprise, volume_percentile,
+     min_surprise, volume_percentile,
      train_ratio, require_positive_surprise) = args
 
     # Ensure paths available in subprocess (needed on Windows spawn)
@@ -79,7 +77,6 @@ def _sweep_worker(args):
     from run_whale_category_backtest import run_whale_category_backtest
 
     params = {
-        "min_whale_wr": min_whale_wr,
         "min_surprise": min_surprise,
         "volume_percentile": volume_percentile,
         "train_ratio": train_ratio,
@@ -88,7 +85,6 @@ def _sweep_worker(args):
 
     whale_config = WhaleConfig(
         mode="volume_only",
-        min_whale_wr=min_whale_wr,
         min_surprise=min_surprise,
         volume_percentile=volume_percentile,
         require_positive_surprise=require_positive_surprise,

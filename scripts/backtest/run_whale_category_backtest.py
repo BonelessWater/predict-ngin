@@ -21,6 +21,9 @@ import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+import hashlib
+import json
+from typing import Dict
 
 _project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_project_root))
@@ -59,34 +62,111 @@ from trading.data_modules.costs import CostModel, DEFAULT_COST_MODEL
 from trading.reporting import generate_quantstats_report
 
 
-def _monthly_whale_worker(args):
-    """Top-level worker: build surprise-positive whale set for one month.
+def _whale_qualifying_params_hash(cfg: "WhaleConfig") -> str:
+    """Stable hash of the parameters that define which whales qualify.
+
+    If any qualifying parameter changes, the hash changes and all cached
+    whale sets are ignored (effectively invalidated by missing cache files).
+    """
+    params = {
+        "volume_percentile": cfg.volume_percentile,
+        "min_surprise": cfg.min_surprise,
+        "min_trades_for_surprise": cfg.min_trades_for_surprise,
+        "require_positive_surprise": cfg.require_positive_surprise,
+        "recency_halflife_days": cfg.recency_halflife_days,
+        "bayes_prior_alpha": cfg.bayes_prior_alpha,
+        "bayes_prior_beta": cfg.bayes_prior_beta,
+    }
+    return hashlib.sha256(
+        json.dumps(params, sort_keys=True).encode()
+    ).hexdigest()[:16]
+
+
+def _whale_cache_path(cache_dir: Path, cutoff: "pd.Timestamp", params_hash: str) -> Path:
+    week_str = pd.Timestamp(cutoff).strftime("%Y-%m-%d")
+    return cache_dir / f"whale_{week_str}_{params_hash}.json"
+
+
+def _load_whale_set_cache(cache_dir: Path, cutoff: "pd.Timestamp", params_hash: str):
+    """Return (whale_set, scores, winrates) from cache, or None if not cached."""
+    path = _whale_cache_path(cache_dir, cutoff, params_hash)
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return set(data["whale_set"]), data["scores"], data["winrates"]
+    except Exception:
+        return None
+
+
+def _save_whale_set_cache(
+    cache_dir: Path,
+    cutoff: "pd.Timestamp",
+    params_hash: str,
+    whale_set,
+    scores,
+    winrates,
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = _whale_cache_path(cache_dir, cutoff, params_hash)
+    with open(path, "w") as f:
+        json.dump(
+            {"whale_set": list(whale_set), "scores": scores, "winrates": winrates},
+            f,
+        )
+
+
+def _weekly_whale_worker(args):
+    """Top-level worker: build surprise-positive whale set for one week.
 
     Reads trades from a temp parquet path so the large DataFrame is not
     serialized over pickle — the OS page cache makes re-reads fast.
+
+    Checks the whale-set cache first (keyed by cutoff date + params hash).
+    Writes result to cache after computing.
     """
-    (year, month, cutoff_str, trades_parquet_path, resolution_winners,
-     min_surprise, min_trades_for_surprise, min_whale_wr,
-     require_positive_surprise, volume_percentile) = args
+    (week_key, cutoff_str, trades_parquet_path, resolution_winners,
+     min_surprise, min_trades_for_surprise,
+     require_positive_surprise, volume_percentile,
+     recency_halflife_days, bayes_prior_alpha, bayes_prior_beta,
+     cache_dir_str, params_hash) = args
 
     from src.whale_strategy.whale_surprise import build_surprise_positive_whale_set
 
-    trades = pd.read_parquet(trades_parquet_path)
     cutoff = pd.Timestamp(cutoff_str)
+
+    # Check cache first
+    if cache_dir_str:
+        cached = _load_whale_set_cache(Path(cache_dir_str), cutoff, params_hash)
+        if cached is not None:
+            return week_key, cached
+
+    trades = pd.read_parquet(trades_parquet_path)
     hist_df = trades[trades["datetime"] <= cutoff]
     if len(hist_df) < 1000:
-        return (year, month), (set(), {}, {})
+        return week_key, (set(), {}, {})
 
     w, s, wr = build_surprise_positive_whale_set(
         hist_df,
         resolution_winners,
         min_surprise=min_surprise,
         min_trades=min_trades_for_surprise,
-        min_actual_win_rate=min_whale_wr,
         require_positive_surprise=require_positive_surprise,
         volume_percentile=volume_percentile,
+        cutoff=cutoff,
+        recency_halflife_days=recency_halflife_days,
+        bayes_prior_alpha=bayes_prior_alpha,
+        bayes_prior_beta=bayes_prior_beta,
     )
-    return (year, month), (w, s, wr)
+
+    if cache_dir_str:
+        try:
+            _save_whale_set_cache(Path(cache_dir_str), cutoff, params_hash, w, s, wr)
+        except Exception:
+            pass  # Cache write failure is non-fatal
+
+    return week_key, (w, s, wr)
 
 
 def _category_backtest_worker(args):
@@ -124,6 +204,79 @@ def _to_datetime_safe(value) -> pd.Timestamp:
             ts /= 1000
         return pd.to_datetime(ts, unit="s", errors="coerce")
     return pd.to_datetime(value, errors="coerce")
+
+
+def _market_resolution_dates(markets_df: pd.DataFrame) -> dict:
+    """
+    Build {market_id: pd.Timestamp} of actual resolution/close dates from markets_df.
+
+    Used to filter resolution_winners to only markets whose outcome was publicly
+    known at a given cutoff date, preventing look-ahead bias in whale scoring.
+    """
+    dates = {}
+    if markets_df.empty:
+        return dates
+    for _, row in markets_df.iterrows():
+        mid = str(row.get("market_id", row.get("conditionId", ""))).strip().replace(".0", "")
+        if not mid:
+            continue
+        for k in ("closedTime", "endDateIso", "endDate"):
+            if k in row and pd.notna(row.get(k)):
+                try:
+                    ts = _to_datetime_safe(row[k])
+                    if pd.notna(ts):
+                        dates[mid] = ts
+                        break
+                except Exception:
+                    pass
+    return dates
+
+
+def _filter_winners_at_cutoff(
+    resolution_winners: dict,
+    resolution_dates: dict,
+    cutoff: pd.Timestamp,
+) -> dict:
+    """
+    Return only resolution_winners for markets confirmed resolved by cutoff.
+
+    Markets without a known resolution date are excluded — we cannot confirm
+    the outcome was publicly available before the cutoff, so including them
+    in whale scoring would be look-ahead biased.
+    """
+    cutoff_date = pd.Timestamp(cutoff).date()
+    return {
+        mid: winner
+        for mid, winner in resolution_winners.items()
+        if mid in resolution_dates
+        and pd.Timestamp(resolution_dates[mid]).date() <= cutoff_date
+    }
+
+
+def _build_scheduled_end_dates(markets_df: pd.DataFrame) -> dict:
+    """
+    Build {market_id: pd.Timestamp} of scheduled close dates using only published fields.
+
+    Uses endDateIso and endDate (known at trade time). Deliberately excludes closedTime,
+    which records the actual resolution timestamp — using it would be look-ahead biased.
+    """
+    dates = {}
+    if markets_df.empty:
+        return dates
+    for _, row in markets_df.iterrows():
+        mid = str(row.get("market_id", row.get("conditionId", ""))).strip().replace(".0", "")
+        if not mid:
+            continue
+        for k in ("endDateIso", "endDate"):
+            if k in row and pd.notna(row.get(k)):
+                try:
+                    ts = _to_datetime_safe(row[k])
+                    if pd.notna(ts):
+                        dates[mid] = ts
+                        break
+                except Exception:
+                    pass
+    return dates
 
 
 def build_resolution_map_from_winners(
@@ -189,8 +342,10 @@ def run_whale_category_backtest(
     volume_only: bool = None,
     unfavored_only: bool = None,
     unfavored_max_price: float = None,
-    rebalance_freq: str = "1M",
+    rebalance_freq: str = "1W",
     n_workers: int = 1,
+    extra_resolutions_dir: Path = None,
+    whale_cache_dir: Path = None,
 ) -> dict:
     """
     Run whale-following backtest with category limits.
@@ -221,12 +376,21 @@ def run_whale_category_backtest(
 
     markets_df = load_research_markets(research_dir, categories=categories)
     resolution_winners = load_resolution_winners(research_dir, db_path=db_path)
+    # Merge extra resolutions (e.g. poly_cat has 51k vs research's 2k)
+    if extra_resolutions_dir is not None:
+        extra = load_resolution_winners(Path(extra_resolutions_dir))
+        resolution_winners = {**extra, **resolution_winners}  # research takes precedence
+
+    # Build resolution date map for look-ahead-free whale scoring.
+    # Used to filter resolution_winners to only markets whose outcome was
+    # publicly known at each rolling cutoff (see _filter_winners_at_cutoff).
+    market_resolution_dates = _market_resolution_dates(markets_df)
 
     if not resolution_winners:
         if surprise_only:
             return {"error": "Surprise-only mode requires resolutions. Run --extract-resolutions first."}
-        if cfg.min_whale_wr > 0 or cfg.require_positive_surprise:
-            return {"error": "Performance filter (WR>=50%%, positive surprise) requires resolutions. Run --extract-resolutions first."}
+        if cfg.require_positive_surprise:
+            return {"error": "Performance filter (positive surprise) requires resolutions. Run --extract-resolutions first."}
         print("Warning: No resolution data. Using simplified whale identification (no scoring).")
 
     # Train/test split
@@ -234,72 +398,119 @@ def run_whale_category_backtest(
     train_df = trades_df[trades_df["datetime"] <= split_date]
     test_df = trades_df[trades_df["datetime"] > split_date]
 
-    # Performance filter: WR >= min_whale_wr and positive surprise (default when resolutions exist)
-    use_performance_filter = resolution_winners and (cfg.min_whale_wr > 0 or cfg.require_positive_surprise)
+    # Performance filter: positive expected return (capital-weighted shrunk WR > expected WR)
+    use_performance_filter = resolution_winners and cfg.require_positive_surprise
 
-    # Build monthly whale sets for rolling rebalancing (when resolutions + rebalance_freq)
-    monthly_whale_sets: dict = {}  # (year, month) -> (whales, scores, winrates)
+    # Build weekly whale sets for rolling rebalancing (when resolutions + rebalance_freq).
+    # Weekly granularity ensures whale qualification reflects the most recent information.
+    # Results are cached on disk keyed by (cutoff_date, params_hash) — if qualifying
+    # parameters change, the hash changes and cached files are automatically bypassed.
+    weekly_whale_sets: dict = {}  # week_key -> (whales, scores, winrates)
     whale_scores_override = None
     whale_winrates_override = None
     whales = set()
 
+    if whale_cache_dir is None:
+        whale_cache_dir = _project_root / "cache" / "whale_sets"
+    params_hash = _whale_qualifying_params_hash(cfg)
+
     if use_performance_filter and rebalance_freq:
-        # Rolling monthly: re-identify whales at start of each month from data up to end of previous month
-        test_months = test_df["datetime"].dt.to_period("M").unique()
-        if n_workers > 1 and len(test_months) > 1:
+        # Rolling weekly: re-identify whales at start of each week from all data up to end of prior week.
+        test_weeks = test_df["datetime"].dt.to_period("W").unique()
+        if n_workers > 1 and len(test_weeks) > 1:
             # Write trades to temp parquet so workers load from disk (no pickle of large DataFrame)
             _tmp_fd, _tmp_path = tempfile.mkstemp(suffix=".parquet")
             os.close(_tmp_fd)
             try:
                 trades_df.to_parquet(_tmp_path)
-                month_args = [
-                    (p.year, p.month,
-                     str(p.to_timestamp(how="start") - pd.Timedelta(days=1)),
-                     _tmp_path, resolution_winners,
-                     cfg.min_surprise, cfg.min_trades_for_surprise, cfg.min_whale_wr,
-                     cfg.require_positive_surprise, cfg.volume_percentile)
-                    for p in sorted(test_months)
-                ]
-                n_month_workers = min(n_workers, len(month_args))
-                print(f"  Parallel monthly whale sets: {len(month_args)} months, {n_month_workers} workers")
-                with ProcessPoolExecutor(max_workers=n_month_workers) as pool:
-                    for ym, whale_data in pool.map(_monthly_whale_worker, month_args):
-                        monthly_whale_sets[ym] = whale_data
+                week_args = []
+                for p in sorted(test_weeks):
+                    cutoff = p.start_time - pd.Timedelta(days=1)  # end of previous week
+                    week_key = str(p.start_time.date())
+                    week_args.append((
+                        week_key,
+                        str(cutoff),
+                        _tmp_path,
+                        _filter_winners_at_cutoff(resolution_winners, market_resolution_dates, cutoff),
+                        cfg.min_surprise, cfg.min_trades_for_surprise,
+                        cfg.require_positive_surprise, cfg.volume_percentile,
+                        cfg.recency_halflife_days, cfg.bayes_prior_alpha, cfg.bayes_prior_beta,
+                        str(whale_cache_dir), params_hash,
+                    ))
+                n_week_workers = min(n_workers, len(week_args))
+                print(f"  Parallel weekly whale sets: {len(week_args)} weeks, {n_week_workers} workers")
+                with ProcessPoolExecutor(max_workers=n_week_workers) as pool:
+                    for wk, whale_data in pool.map(_weekly_whale_worker, week_args):
+                        weekly_whale_sets[wk] = whale_data
                         whales |= whale_data[0]
             finally:
                 Path(_tmp_path).unlink(missing_ok=True)
         else:
-            for period in sorted(test_months):
-                ym = (period.year, period.month)
-                cutoff = period.to_timestamp(how="start") - pd.Timedelta(days=1)  # End of previous month
+            for period in sorted(test_weeks):
+                week_key = str(period.start_time.date())
+                cutoff = period.start_time - pd.Timedelta(days=1)  # end of previous week
+
+                # Check cache
+                cached = _load_whale_set_cache(whale_cache_dir, cutoff, params_hash)
+                if cached is not None:
+                    weekly_whale_sets[week_key] = cached
+                    whales |= cached[0]
+                    continue
+
                 hist_df = trades_df[trades_df["datetime"] <= cutoff]
                 if len(hist_df) < 1000:
-                    monthly_whale_sets[ym] = (set(), {}, {})
+                    weekly_whale_sets[week_key] = (set(), {}, {})
                     continue
+                cutoff_winners = _filter_winners_at_cutoff(
+                    resolution_winners, market_resolution_dates, cutoff
+                )
                 w, s, wr = build_surprise_positive_whale_set(
                     hist_df,
-                    resolution_winners,
+                    cutoff_winners,
                     min_surprise=cfg.min_surprise,
                     min_trades=cfg.min_trades_for_surprise,
-                    min_actual_win_rate=cfg.min_whale_wr,
                     require_positive_surprise=cfg.require_positive_surprise,
                     volume_percentile=cfg.volume_percentile,
+                    cutoff=cutoff,
+                    recency_halflife_days=cfg.recency_halflife_days,
+                    bayes_prior_alpha=cfg.bayes_prior_alpha,
+                    bayes_prior_beta=cfg.bayes_prior_beta,
                 )
-                monthly_whale_sets[ym] = (w, s, wr)
+                weekly_whale_sets[week_key] = (w, s, wr)
                 whales |= w
-        print(f"  Rolling monthly: {len(whales)} qualified whales (WR>={cfg.min_whale_wr*100:.0f}%, surprise>0) across {len(monthly_whale_sets)} months")
+                try:
+                    _save_whale_set_cache(whale_cache_dir, cutoff, params_hash, w, s, wr)
+                except Exception:
+                    pass
+        print(f"  Rolling weekly: {len(whales)} qualified whales (positive surprise) across {len(weekly_whale_sets)} weeks")
     elif use_performance_filter and resolution_winners:
-        # Single train-period whale set with performance filter
-        whales, whale_scores_override, whale_winrates_override = build_surprise_positive_whale_set(
-            train_df,
-            resolution_winners,
-            min_surprise=cfg.min_surprise,
-            min_trades=cfg.min_trades_for_surprise,
-            min_actual_win_rate=cfg.min_whale_wr,
-            require_positive_surprise=cfg.require_positive_surprise,
-            volume_percentile=cfg.volume_percentile,
+        # Single train-period whale set — filter to resolutions known by split date
+        split_cutoff_winners = _filter_winners_at_cutoff(
+            resolution_winners, market_resolution_dates, split_date
         )
-        print(f"  Qualified whales: {len(whales)} (WR>={cfg.min_whale_wr*100:.0f}%, surprise>0)")
+        # Check cache for the single-period whale set
+        cached = _load_whale_set_cache(whale_cache_dir, split_date, params_hash)
+        if cached is not None:
+            whales, whale_scores_override, whale_winrates_override = cached
+        else:
+            whales, whale_scores_override, whale_winrates_override = build_surprise_positive_whale_set(
+                train_df,
+                split_cutoff_winners,
+                min_surprise=cfg.min_surprise,
+                min_trades=cfg.min_trades_for_surprise,
+                require_positive_surprise=cfg.require_positive_surprise,
+                volume_percentile=cfg.volume_percentile,
+                cutoff=split_date,
+                recency_halflife_days=cfg.recency_halflife_days,
+                bayes_prior_alpha=cfg.bayes_prior_alpha,
+                bayes_prior_beta=cfg.bayes_prior_beta,
+            )
+            try:
+                _save_whale_set_cache(whale_cache_dir, split_date, params_hash,
+                                      whales, whale_scores_override, whale_winrates_override)
+            except Exception:
+                pass
+        print(f"  Qualified whales: {len(whales)} (positive expected return)")
     elif volume_only and not resolution_winners:
         whales, whale_scores_override, whale_winrates_override = build_volume_whale_set(
             train_df, volume_percentile=cfg.volume_percentile
@@ -346,12 +557,72 @@ def run_whale_category_backtest(
     # Build resolution map
     resolutions = build_resolution_map_from_winners(resolution_winners, markets_df)
 
-    # Market liquidity
+    # Scheduled end dates: published close dates known at trade time (for TTR filter).
+    # Uses endDateIso/endDate only — excludes closedTime (actual resolution, look-ahead biased).
+    scheduled_end_dates = _build_scheduled_end_dates(markets_df)
+
+    # Market liquidity + metadata lookup dicts (market_id → value)
     market_liquidity = {}
+    market_titles: dict = {}   # market_id → question/title string
+    market_slugs: dict = {}    # market_id → slug for URL construction
     for _, row in markets_df.iterrows():
         mid = str(row.get("market_id", "")).strip().replace(".0", "")
         liq = row.get("liquidityNum") or row.get("liquidity") or row.get("volumeNum") or row.get("volume")
         market_liquidity[mid] = float(liq) if liq is not None else 100_000
+        if not market_titles.get(mid):
+            market_titles[mid] = str(row.get("question") or row.get("title") or "")
+        if not market_slugs.get(mid):
+            market_slugs[mid] = str(row.get("slug") or row.get("eventSlug") or "")
+
+    # Also pull titles/slugs from trades data (trades have title/slug per row)
+    for col_mid, col_title, col_slug in [("market_id", "title", "slug"), ("market_id", "title", "eventSlug")]:
+        if col_title in trades_df.columns and col_mid in trades_df.columns:
+            for _, row in trades_df.drop_duplicates(subset=[col_mid]).iterrows():
+                mid = str(row[col_mid]).strip().replace(".0", "")
+                if mid and not market_titles.get(mid):
+                    market_titles[mid] = str(row.get(col_title) or "")
+                if mid and not market_slugs.get(mid) and col_slug in trades_df.columns:
+                    market_slugs[mid] = str(row.get(col_slug) or "")
+            break
+
+    # Price store — created here (before IC computation and backtest loop)
+    price_store = ResearchPriceStore(research_dir, categories=categories)
+
+    # IC computation: measure short-term directional accuracy on training period.
+    # Blended into whale scores: final_score = (1-w)*surprise_score + w*ic_score_normalized.
+    whale_ic_scores: Dict[str, float] = {}
+    if cfg.ic_score_weight > 0 and whales:
+        from src.whale_strategy.whale_surprise import compute_whale_ic
+        whale_ic_scores = compute_whale_ic(
+            train_df[train_df["maker"].isin(whales)],
+            price_lookup_fn=price_store.price_at_or_before,
+            horizon_days=cfg.ic_horizon_days,
+            min_trades=cfg.ic_min_trades,
+        )
+        if whale_ic_scores:
+            # Blend IC into weekly whale scores. IC is normalized to [0, 10] same scale as surprise score.
+            # IC = 0.50 → neutral (score 5.0); IC = 1.0 → perfect (10.0); IC = 0.0 → (0.0)
+            for wk, (w_set, w_scores, w_wr) in weekly_whale_sets.items():
+                blended = {}
+                for addr, s_score in w_scores.items():
+                    ic = whale_ic_scores.get(addr)
+                    if ic is not None:
+                        ic_score_norm = max(0.0, min(ic * 10.0, 10.0))
+                        blended[addr] = (1.0 - cfg.ic_score_weight) * s_score + cfg.ic_score_weight * ic_score_norm
+                    else:
+                        blended[addr] = s_score
+                weekly_whale_sets[wk] = (w_set, blended, w_wr)
+            # Also blend into single-period override if used
+            if whale_scores_override:
+                for addr in list(whale_scores_override.keys()):
+                    ic = whale_ic_scores.get(addr)
+                    if ic is not None:
+                        ic_score_norm = max(0.0, min(ic * 10.0, 10.0))
+                        whale_scores_override[addr] = (
+                            (1.0 - cfg.ic_score_weight) * whale_scores_override[addr]
+                            + cfg.ic_score_weight * ic_score_norm
+                        )
+            print(f"  IC computed for {len(whale_ic_scores)} whales (horizon={cfg.ic_horizon_days}d, weight={cfg.ic_score_weight:.0%})")
 
     # Filter to unfavored trades only (underdog: BUY <=40c, SELL >=60c)
     signals_df = test_df
@@ -403,14 +674,34 @@ def run_whale_category_backtest(
                 historical_winrate=0.55,
             ))
 
-    # Price store
-    price_store = ResearchPriceStore(research_dir, categories=categories)
-
     # Backtest loop
     state = StrategyState(total_capital=capital)
     open_positions = {}
     closed_trades = []
     cost_model = DEFAULT_COST_MODEL
+
+    def _pos_meta(pos: Position, exit_mid: str) -> dict:
+        """Extra columns for manual verification of a closed trade."""
+        slug = market_slugs.get(exit_mid, "")
+        url = f"https://polymarket.com/event/{slug}" if slug else f"https://polymarket.com/market/{exit_mid}"
+        res = resolutions.get(exit_mid, {})
+        resolution_val = res.get("resolution")
+        if resolution_val is None:
+            resolution_outcome = ""
+        else:
+            resolution_outcome = "YES" if resolution_val == 1.0 else "NO"
+        sched_end = scheduled_end_dates.get(exit_mid)
+        return {
+            "market_title":          market_titles.get(exit_mid, ""),
+            "market_url":            url,
+            "whale_token_side":      pos.whale_token_side,   # YES or NO — what whale bought
+            "whale_score":           round(pos.whale_score, 3),
+            "whale_winrate":         round(pos.whale_winrate, 3),
+            "taker_address":         pos.taker_address,      # counterpart on original trade
+            "signal_trade_size_usd": round(pos.signal_trade_size_usd, 2),  # whale's original bet
+            "market_end_date":       str(sched_end.date()) if sched_end and pd.notna(sched_end) else "",
+            "resolution_outcome":    resolution_outcome,
+        }
 
     # Sort signals by datetime
     signals_sorted = sorted(signals, key=lambda s: s.datetime)
@@ -478,6 +769,7 @@ def run_whale_category_backtest(
                 "position_size": pos.size_usd,
                 "whale_address": pos.whale_address,
                 "category": pos.category,
+                **_pos_meta(pos, mid),
             })
 
             # Update state
@@ -486,13 +778,57 @@ def run_whale_category_backtest(
             state.whale_exposure[pos.whale_address] = state.whale_exposure.get(pos.whale_address, 0) - pos.size_usd
             state.market_exposure.pop(mid, None)
 
+        # 1b. Partial exit: lock in gains when unrealized gain >= threshold.
+        # Closes partial_exit_fraction of the position once per position.
+        # Does not require resolution — uses CLOB price to measure gain.
+        if cfg.partial_exit_gain_threshold > 0 and cfg.partial_exit_fraction > 0:
+            for mid, pos in list(open_positions.items()):
+                if pos.partial_exit_done:
+                    continue
+                clob_price = price_store.price_at_or_before(mid, current_date)
+                if clob_price is None:
+                    continue
+                if pos.side.upper() == "BUY":
+                    exit_price_pe = clob_price
+                    gain_pct = (exit_price_pe - pos.entry_price) / max(pos.entry_price, 1e-6)
+                else:
+                    exit_price_pe = 1.0 - clob_price
+                    entry_no = 1.0 - pos.entry_price
+                    gain_pct = (exit_price_pe - entry_no) / max(entry_no, 1e-6)
+                if gain_pct < cfg.partial_exit_gain_threshold:
+                    continue
+                # Execute partial exit
+                exit_size = pos.size_usd * cfg.partial_exit_fraction
+                if pos.side.upper() == "BUY":
+                    gross_pe = (exit_price_pe - pos.entry_price) * (exit_size / pos.entry_price)
+                else:
+                    entry_no = 1.0 - pos.entry_price
+                    gross_pe = (exit_price_pe - entry_no) * (exit_size / max(entry_no, 1e-6))
+                net_pe = gross_pe * 0.97
+                closed_trades.append({
+                    "market_id": mid, "entry_date": pos.entry_date, "exit_date": current_date,
+                    "direction": pos.side, "entry_price": pos.entry_price, "exit_price": exit_price_pe,
+                    "gross_pnl": gross_pe, "net_pnl": net_pe, "position_size": exit_size,
+                    "whale_address": pos.whale_address, "category": pos.category,
+                    "reason": "PARTIAL_EXIT",
+                    **_pos_meta(pos, mid),
+                })
+                # Reduce position size; leave remainder open
+                remaining_size = pos.size_usd * (1.0 - cfg.partial_exit_fraction)
+                pos.size_usd = remaining_size
+                pos.partial_exit_done = True
+                state.category_exposure[pos.category] = state.category_exposure.get(pos.category, 0) - exit_size
+                state.whale_exposure[pos.whale_address] = state.whale_exposure.get(pos.whale_address, 0) - exit_size
+                state.market_exposure[mid] = remaining_size
+
         # 2. Process signals for today
         today_signals = [s for s in signals_sorted if s.datetime.normalize() == current_date]
         for sig in today_signals:
-            # Rolling: only follow if whale is in active set for this month; use per-month scores
-            if monthly_whale_sets:
-                ym = (sig.datetime.year, sig.datetime.month)
-                active_whales, active_scores, active_winrates = monthly_whale_sets.get(ym, (set(), {}, {}))
+            # Rolling: only follow if whale is in active set for this week; use per-week scores.
+            # week_key = ISO start date of the week containing this signal (e.g. "2025-03-03").
+            if weekly_whale_sets:
+                week_key = str(sig.datetime.to_period("W").start_time.date())
+                active_whales, active_scores, active_winrates = weekly_whale_sets.get(week_key, (set(), {}, {}))
                 if sig.whale_address not in active_whales:
                     continue
                 if active_scores:
@@ -520,6 +856,7 @@ def run_whale_category_backtest(
                         "gross_pnl": gross, "net_pnl": gross * 0.97, "position_size": pos.size_usd,
                         "whale_address": pos.whale_address, "category": pos.category,
                         "reason": "CONFLICTING_SIGNAL",
+                        **_pos_meta(pos, mid),
                     })
                     open_positions.pop(mid)
                     state.positions = [p for p in state.positions if p.market_id != mid]
@@ -536,9 +873,18 @@ def run_whale_category_backtest(
             if res.get("resolution_date") and pd.to_datetime(res["resolution_date"]).date() <= current_date.date():
                 continue
 
-            # Entry price bounds: skip near-certain markets
-            if not (cfg.min_entry_yes_price <= sig.price <= cfg.max_entry_yes_price):
+            # Entry price upper bound: skip near-resolved markets
+            if sig.price > cfg.max_entry_yes_price:
                 continue
+
+            # Scheduled TTR filter: skip if market is scheduled to close too soon.
+            # Uses published endDateIso/endDate (known at trade time), not closedTime.
+            if cfg.min_ttr_entry_days > 0:
+                sched_end = scheduled_end_dates.get(mid)
+                if sched_end is not None:
+                    days_to_close = (pd.Timestamp(sched_end).date() - current_date.date()).days
+                    if days_to_close < cfg.min_ttr_entry_days:
+                        continue
 
             # Multi-whale confirmation
             if cfg.min_confirmation_whales > 1:
@@ -569,6 +915,10 @@ def run_whale_category_backtest(
                 whale_address=sig.whale_address,
                 whale_score=sig.score,
                 entry_date=pd.to_datetime(current_date),
+                whale_winrate=sig.historical_winrate,
+                taker_address=sig.taker_address,
+                whale_token_side=sig.whale_token_side,
+                signal_trade_size_usd=sig.signal_trade_size_usd,
             )
             open_positions[mid] = pos
             state.positions.append(pos)
@@ -594,6 +944,7 @@ def run_whale_category_backtest(
                 "gross_pnl": gross, "net_pnl": gross * 0.97, "position_size": pos.size_usd,
                 "whale_address": pos.whale_address, "category": pos.category,
                 "reason": "OPEN_AT_END",
+                **_pos_meta(pos, mid),
             })
 
     price_store.close()
@@ -656,10 +1007,12 @@ def run_whale_category_backtest(
 # One-at-a-time sensitivity grids for each tuneable parameter.
 # Values span a wide range so we can see the full response curve, not just the optimum.
 SENSITIVITY_GRIDS: dict = {
+    # max_entry_yes_price: test whether the dust-exclusion threshold is robust.
     "max_entry_yes_price": [0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.98, 1.00],
-    "min_entry_yes_price": [0.00, 0.01, 0.02, 0.05, 0.08, 0.10, 0.15],
+    # min_confirmation_whales: test signal quality filter.
+    # confirmation_window_days is omitted — it is flat while min_confirmation_whales=1
+    # (the default disables the check); only meaningful if confirmation is enabled.
     "min_confirmation_whales": [1, 2, 3, 4],
-    "confirmation_window_days": [3, 7, 14, 21, 30],
     "max_hold_days": [0, 30, 60, 90, 180],
 }
 
@@ -716,7 +1069,7 @@ def run_sensitivity_test(
                 categories=categories,
                 db_path=db_path,
                 whale_config=cfg,
-                rebalance_freq="1M",
+                rebalance_freq="1W",
                 n_workers=n_workers,
             )
             marker = " <-- current" if v == default_val else ""
@@ -772,9 +1125,200 @@ def run_sensitivity_test(
     return df
 
 
+def _wf_cache_key(
+    fold_start: str,
+    test_start: str,
+    test_end: str,
+    whale_config: WhaleConfig,
+    categories: list,
+) -> str:
+    """Stable hash key for one walk-forward fold."""
+    payload = {
+        "fold_start": fold_start,
+        "test_start": test_start,
+        "test_end": test_end,
+        "config": dataclasses.asdict(whale_config),
+        "categories": sorted(categories or []),
+    }
+    return hashlib.md5(
+        json.dumps(payload, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def _wf_load_cache(cache_dir: Path, key: str) -> dict:
+    path = cache_dir / f"{key}.json"
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def _wf_save_cache(cache_dir: Path, key: str, row: dict) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with open(cache_dir / f"{key}.json", "w") as f:
+        json.dump(row, f, default=str)
+
+
+def run_walk_forward_backtest(
+    research_dir: Path,
+    capital: float,
+    categories: list,
+    db_path: str,
+    whale_config: WhaleConfig,
+    n_workers: int,
+    window_months: int = 12,
+    step_days: int = 7,
+    min_train_months: int = 6,
+    cache_dir: Path = None,
+) -> pd.DataFrame:
+    """
+    Rolling walk-forward validation stepping one week at a time.
+
+    Each fold:
+    - Train: [fold_start, fold_start + min_train_months)
+    - Test:  [fold_start + min_train_months, fold_start + window_months)
+    - Step:  fold_start advances by step_days (default 7 = weekly)
+
+    Caching: each fold's metrics are saved to cache_dir as a JSON file keyed by
+    the fold date range + config hash.  On re-run, cached folds are loaded instantly
+    without recomputing; only new folds are computed.
+
+    Purpose: verify performance is stable across all time periods, not concentrated
+    in the single backtest window.
+    """
+    from src.whale_strategy.research_data_loader import load_research_trades
+
+    all_trades = load_research_trades(research_dir, categories=categories)
+    if all_trades.empty:
+        print("Walk-forward: No trades loaded.")
+        return pd.DataFrame()
+
+    date_min = all_trades["datetime"].min()
+    date_max = all_trades["datetime"].max()
+    del all_trades  # free memory; each fold re-loads with date filter
+
+    if cache_dir is None:
+        cache_dir = research_dir.parent / "output" / "whale_following" / "walk_forward_cache"
+
+    # Count total folds upfront for progress display
+    fold_start_probe = date_min
+    total_folds = 0
+    while True:
+        if fold_start_probe + pd.DateOffset(months=window_months) > date_max:
+            break
+        total_folds += 1
+        fold_start_probe += pd.Timedelta(days=step_days)
+
+    print(f"\nWalk-forward: window={window_months}m, step={step_days}d, min_train={min_train_months}m")
+    print(f"  Data range: {date_min.date()} → {date_max.date()}")
+    print(f"  Total folds: {total_folds}  |  Cache: {cache_dir}")
+    print(f"{'Fold':>5}  {'Train start':>12}  {'Test start':>12}  {'Test end':>12}  "
+          f"{'Trades':>7}  {'Win%':>6}  {'Sharpe':>7}  {'NetPnL':>12}  {'Src':>5}")
+
+    fold_rows = []
+    fold_start = date_min
+    fold_idx = 0
+    cached_count = 0
+    computed_count = 0
+
+    while True:
+        test_end = fold_start + pd.DateOffset(months=window_months)
+        if test_end > date_max:
+            break
+
+        train_end = fold_start + pd.DateOffset(months=min_train_months)
+        fold_start_str = str(fold_start.date())
+        train_end_str = str(train_end.date())
+        test_end_str = str(test_end.date())
+
+        # Check cache
+        key = _wf_cache_key(fold_start_str, train_end_str, test_end_str, whale_config, categories)
+        cached = _wf_load_cache(cache_dir, key)
+
+        if cached:
+            row = cached
+            src = "cache"
+            cached_count += 1
+        else:
+            train_ratio = min_train_months / window_months
+            result = run_whale_category_backtest(
+                research_dir=research_dir,
+                capital=capital,
+                categories=categories,
+                db_path=db_path,
+                whale_config=whale_config,
+                train_ratio=train_ratio,
+                start_date=fold_start_str,
+                end_date=test_end_str,
+                rebalance_freq="1W",
+                n_workers=n_workers,
+            )
+            src = "run"
+            computed_count += 1
+
+            if "error" in result:
+                row = {
+                    "fold": fold_idx, "train_start": fold_start_str,
+                    "test_start": train_end_str, "test_end": test_end_str,
+                    "error": result["error"],
+                }
+            else:
+                row = {
+                    "fold": fold_idx, "train_start": fold_start_str,
+                    "test_start": train_end_str, "test_end": test_end_str,
+                    "total_trades": result["total_trades"],
+                    "win_rate_pct": result["win_rate"] * 100,
+                    "sharpe": result["sharpe_ratio"],
+                    "net_pnl": result["total_net_pnl"],
+                    "roi_pct": result.get("roi_pct", 0),
+                    "profit_factor": min(result.get("profit_factor", 0), 99.0),
+                    "max_drawdown_pct": result.get("max_drawdown_pct", 0),
+                }
+            _wf_save_cache(cache_dir, key, row)
+
+        # Always update fold index (cache may have stale index)
+        row["fold"] = fold_idx
+
+        if "error" in row:
+            print(f"{fold_idx:>5}  {fold_start_str:>12}  {train_end_str:>12}  {test_end_str:>12}  "
+                  f"  ERROR: {row['error']}  [{src}]")
+        else:
+            t = row.get("total_trades", 0)
+            wr = row.get("win_rate_pct", 0)
+            sh = row.get("sharpe", 0)
+            pnl = row.get("net_pnl", 0)
+            print(f"{fold_idx:>5}  {fold_start_str:>12}  {train_end_str:>12}  {test_end_str:>12}  "
+                  f"{t:>7,}  {wr:>5.1f}%  {sh:>7.2f}  ${pnl:>11,.0f}  [{src}]")
+
+        fold_rows.append(row)
+        fold_start += pd.Timedelta(days=step_days)
+        fold_idx += 1
+
+    df = pd.DataFrame(fold_rows)
+    valid = df.dropna(subset=["net_pnl"]) if "net_pnl" in df.columns else pd.DataFrame()
+
+    print(f"\n{'='*72}")
+    print(f"Walk-forward complete: {fold_idx} folds  ({cached_count} cached, {computed_count} computed)")
+    if not valid.empty:
+        profitable = (valid["net_pnl"] > 0).sum()
+        has_trades = (valid["total_trades"] > 0).sum()
+        print(f"  Folds with trades:    {has_trades}/{len(valid)}")
+        print(f"  Profitable folds:     {profitable}/{has_trades} (of folds with trades)")
+        print(f"  Median Sharpe:        {valid['sharpe'].median():.2f}")
+        print(f"  Median win rate:      {valid.loc[valid['total_trades']>0,'win_rate_pct'].median():.1f}%")
+        print(f"  Total PnL (sum):      ${valid['net_pnl'].sum():,.0f}")
+        print(f"  Folds with 0 trades:  {(valid['total_trades']==0).sum()}")
+
+    return df
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Whale-following backtest at category level")
     parser.add_argument("--research-dir", type=Path, default=_project_root / "data" / "research")
+    parser.add_argument(
+        "--resolutions-dir", type=Path, default=_project_root / "data" / "poly_cat",
+        help="Directory containing an extra resolutions.csv to merge (e.g. data/poly_cat has 51k resolved markets)",
+    )
     parser.add_argument("--capital", type=float, default=1_000_000)
     parser.add_argument("--min-usd", type=float, default=100)
     parser.add_argument("--position-size", type=float, default=25_000)
@@ -827,13 +1371,33 @@ def main() -> int:
     )
     parser.add_argument("--no-quantstats", action="store_true", help="Skip QuantStats tearsheet")
     parser.add_argument("--no-tracker", action="store_true", help="Skip experiment tracker (experiments.db)")
-    parser.add_argument("--backtests-dir", type=Path, default=_project_root / "backtests", help="Directory for backtest storage and experiments.db")
+    parser.add_argument("--backtests-dir", type=Path, default=_project_root / "backtests", help="Directory for backtest storage and catalog.db (default: backtests/)")
     parser.add_argument("--no-rebalance", action="store_true", help="Disable monthly whale rebalancing (use single train-period whale set)")
-    parser.add_argument("--min-entry-price", type=float, default=None, help="Min YES price for entry (default 0.05)")
-    parser.add_argument("--max-entry-price", type=float, default=None, help="Max YES price for entry (default 0.87)")
+    parser.add_argument("--max-entry-price", type=float, default=None, help="Max YES price for entry (default 0.98)")
     parser.add_argument("--min-confirmation-whales", type=int, default=None, help="Distinct whales required to confirm signal (default 1)")
     parser.add_argument("--confirmation-window-days", type=int, default=None, help="Rolling window for confirmation (default 7)")
     parser.add_argument("--max-hold-days", type=int, default=None, help="Force-close positions after N days (default 0=off)")
+    parser.add_argument("--min-ttr-days", type=int, default=None, help="Min scheduled days-to-close before allowing entry (default 3)")
+    parser.add_argument("--no-partial-exit", action="store_true", help="Disable partial exit on large gains")
+    parser.add_argument("--no-ic", action="store_true", help="Disable Information Coefficient scoring (IC)")
+    parser.add_argument("--no-bayes", action="store_true", help="Disable Bayesian shrinkage (use raw win rate)")
+    parser.add_argument("--no-recency", action="store_true", help="Disable recency decay (use uniform weighting)")
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="Run rolling walk-forward validation instead of single backtest",
+    )
+    parser.add_argument("--wf-window-months", type=int, default=12, help="Walk-forward total window per fold in months (default 12)")
+    parser.add_argument("--wf-step-days", type=int, default=7, help="Walk-forward step between folds in days (default 7 = weekly)")
+    parser.add_argument("--wf-min-train-months", type=int, default=6, help="Walk-forward minimum training period in months (default 6)")
+    parser.add_argument("--wf-cache-dir", type=Path, default=None, help="Directory for walk-forward fold cache (default: data/output/whale_following/walk_forward_cache)")
+    parser.add_argument(
+        "--whale-cache-dir", type=Path,
+        default=_project_root / "cache" / "whale_sets",
+        help="Directory for per-week whale set cache (keyed by cutoff + params hash). "
+             "Cache is auto-invalidated when qualifying parameters change. "
+             "(default: cache/whale_sets/)",
+    )
     parser.add_argument(
         "--sensitivity",
         action="store_true",
@@ -843,8 +1407,7 @@ def main() -> int:
         "--sensitivity-params",
         default=None,
         help="Comma-separated parameters to test (default: all). "
-             "Options: max_entry_yes_price, min_entry_yes_price, "
-             "min_confirmation_whales, confirmation_window_days, max_hold_days",
+             "Options: max_entry_yes_price, min_confirmation_whales, max_hold_days",
     )
     parser.add_argument(
         "--workers", type=int, default=35,
@@ -884,8 +1447,6 @@ def main() -> int:
         whale_config.mode = "volume_only"
     if args.surprise_only:
         whale_config.mode = "surprise_only"
-    if args.min_entry_price is not None:
-        whale_config.min_entry_yes_price = args.min_entry_price
     if args.max_entry_price is not None:
         whale_config.max_entry_yes_price = args.max_entry_price
     if args.min_confirmation_whales is not None:
@@ -894,6 +1455,17 @@ def main() -> int:
         whale_config.confirmation_window_days = args.confirmation_window_days
     if args.max_hold_days is not None:
         whale_config.max_hold_days = args.max_hold_days
+    if args.min_ttr_days is not None:
+        whale_config.min_ttr_entry_days = args.min_ttr_days
+    if args.no_partial_exit:
+        whale_config.partial_exit_gain_threshold = 0.0
+    if args.no_ic:
+        whale_config.ic_score_weight = 0.0
+    if args.no_bayes:
+        whale_config.bayes_prior_alpha = 0.0
+        whale_config.bayes_prior_beta = 0.0
+    if args.no_recency:
+        whale_config.recency_halflife_days = 0.0
     surprise_only = whale_config.surprise_only
     volume_only = whale_config.volume_only
     unfavored_only = whale_config.unfavored_only
@@ -913,6 +1485,27 @@ def main() -> int:
     print("  unfavored_only", unfavored_only)
     print("  categories   ", categories or "all")
     print("  workers      ", args.workers)
+
+    # Walk-forward mode — runs before (and instead of) the main backtest
+    if args.walk_forward:
+        wf_df = run_walk_forward_backtest(
+            research_dir=research_dir,
+            capital=args.capital,
+            categories=categories,
+            db_path=args.db_path,
+            whale_config=whale_config,
+            n_workers=args.workers,
+            window_months=args.wf_window_months,
+            step_days=args.wf_step_days,
+            min_train_months=args.wf_min_train_months,
+            cache_dir=args.wf_cache_dir,
+        )
+        if not wf_df.empty:
+            out_path = args.output_dir / "walk_forward_results.csv"
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            wf_df.to_csv(out_path, index=False)
+            print(f"Walk-forward results saved to {out_path}")
+        return 0
 
     # Sensitivity test mode — runs before (and instead of) the main backtest
     if args.sensitivity:
@@ -1000,8 +1593,9 @@ def main() -> int:
                     surprise_only=surprise_only,
                     volume_only=volume_only,
                     unfavored_only=unfavored_only,
-                    rebalance_freq="1M" if not args.no_rebalance else None,
+                    rebalance_freq="1W" if not args.no_rebalance else None,
                     n_workers=1,
+                    whale_cache_dir=args.whale_cache_dir,
                 )
                 r = _save_cat_result(cat, result)
                 if r:
@@ -1033,8 +1627,10 @@ def main() -> int:
         surprise_only=surprise_only,
         volume_only=volume_only,
         unfavored_only=unfavored_only,
-        rebalance_freq="1M" if not args.no_rebalance else None,
+        rebalance_freq="1W" if not args.no_rebalance else None,
         n_workers=args.workers,
+        extra_resolutions_dir=args.resolutions_dir,
+        whale_cache_dir=args.whale_cache_dir,
     )
 
     if "error" in result:
@@ -1065,6 +1661,7 @@ def main() -> int:
         result["trades_df"].to_csv(trades_path, index=False)
         print(f"\nTrades saved to {trades_path}")
 
+    quantstats_html_path = None
     if not args.no_quantstats and "daily_returns" in result and len(result["daily_returns"]) >= 5:
         quantstats_path = output_dir / "quantstats_whale_following.html"
         if generate_quantstats_report(
@@ -1073,6 +1670,25 @@ def main() -> int:
             title="Whale Following Strategy (Category-Level)",
         ):
             print(f"QuantStats tearsheet: {quantstats_path}")
+            quantstats_html_path = quantstats_path
+
+    if not args.no_tracker:
+        try:
+            from src.backtest.storage import save_backtest_result
+            import dataclasses as _dc
+            run_id = save_backtest_result(
+                strategy_name="whale_following",
+                result=result,
+                config=_dc.asdict(whale_config),
+                base_dir=args.backtests_dir,
+                tags=[args.mode] + ([f"cat:{c}" for c in (categories or [])] if categories else []),
+                notes=f"capital={args.capital} min_usd={args.min_usd} mode={args.mode}",
+                quantstats_html_path=quantstats_html_path,
+                auto_index=True,
+            )
+            print(f"Experiment saved: {args.backtests_dir}/whale_following/{run_id}")
+        except Exception as _exc:
+            print(f"Warning: experiment tracker failed: {_exc}")
 
     return 0
 

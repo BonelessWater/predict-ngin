@@ -54,7 +54,6 @@ sys.path.insert(0, str(_scripts_backtest))
 # ---------------------------------------------------------------------------
 
 PARAM_KEYS = [
-    "min_whale_wr",
     "min_surprise",
     "volume_percentile",
     "train_ratio",
@@ -65,25 +64,23 @@ PARAM_KEYS = [
 ]
 
 FULL_GRID = {
-    "min_whale_wr":              [0.50, 0.55, 0.60, 0.65],
     "min_surprise":              [0.0, 0.02, 0.05],
     "volume_percentile":         [85.0, 90.0, 95.0],
     "train_ratio":               [0.3, 0.5, 0.7],
     "require_positive_surprise": [True, False],
     "unfavored_only":            [False, True],
     "unfavored_max_price":       [0.40],        # only one value; interesting when unfavored_only=True
-    "rebalance_freq":            ["1M", "3M"],
+    "rebalance_freq":            ["1W", "2W"],
 }
 
 QUICK_GRID = {
-    "min_whale_wr":              [0.50, 0.60],
     "min_surprise":              [0.0, 0.05],
     "volume_percentile":         [90.0, 95.0],
     "train_ratio":               [0.3],
     "require_positive_surprise": [True],
     "unfavored_only":            [False],
     "unfavored_max_price":       [0.40],
-    "rebalance_freq":            ["1M"],
+    "rebalance_freq":            ["1W"],
 }
 
 METRIC_COLS = ["sharpe", "calmar", "roi_pct", "win_rate", "total_trades", "whales", "max_dd_pct"]
@@ -97,7 +94,7 @@ def _sweep_worker(args):
     """Run one whale backtest configuration. Returns (params, metrics, error)."""
     (project_root_str, research_dir_str, capital, min_usd, position_size,
      start_date, end_date, categories_list,
-     min_whale_wr, min_surprise, volume_percentile, train_ratio,
+     min_surprise, volume_percentile, train_ratio,
      require_positive_surprise, unfavored_only, unfavored_max_price,
      rebalance_freq) = args
 
@@ -113,7 +110,6 @@ def _sweep_worker(args):
     from run_whale_category_backtest import run_whale_category_backtest
 
     params = {
-        "min_whale_wr":              min_whale_wr,
         "min_surprise":              min_surprise,
         "volume_percentile":         volume_percentile,
         "train_ratio":               train_ratio,
@@ -125,7 +121,6 @@ def _sweep_worker(args):
 
     whale_config = WhaleConfig(
         mode="volume_only",
-        min_whale_wr=min_whale_wr,
         min_surprise=min_surprise,
         volume_percentile=volume_percentile,
         require_positive_surprise=require_positive_surprise,

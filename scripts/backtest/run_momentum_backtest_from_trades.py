@@ -101,7 +101,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--backtests-dir",
-        default="backtests",
+        default="data/output/backtests",
         help="Directory for organized backtest storage (default: backtests)",
     )
     parser.add_argument(

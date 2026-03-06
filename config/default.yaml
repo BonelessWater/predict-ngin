@@ -62,8 +62,7 @@ whale_strategy:
   unfavored_only: false
   unfavored_max_price: 0.40
 
-  # Performance filter: only follow whales with WR >= 50% and positive surprise
-  min_whale_wr: 0.50
+  # Performance filter: require positive expected return (capital-weighted shrunk WR > market-implied WR).
   require_positive_surprise: true
 
   # Min trade size (USD) to count
@@ -84,9 +83,9 @@ whale_strategy:
   # Signal generation
   min_signal_usd: 100
 
-  # Entry price bounds: exclude dust markets where implied payout < $0.02/dollar.
-  # Symmetric thresholds derived from economic viability, not backtest performance.
-  min_entry_yes_price: 0.02
+  # Entry price upper bound: skip near-resolved markets (YES > 0.98).
+  # At YES > 0.98 the NO payout is under $0.02/dollar — economically unviable.
+  # Derived from dust-exclusion principle, not backtest performance.
   max_entry_yes_price: 0.98
 
   # Multi-whale confirmation (1 = disabled)
@@ -95,6 +94,25 @@ whale_strategy:
 
   # Max hold days before force-closing at CLOB price (0 = disabled)
   max_hold_days: 0
+
+  # Bayesian shrinkage: Beta-Binomial prior (α=2, β=2 → prior mean 0.50, effective sample 4)
+  bayes_prior_alpha: 2.0
+  bayes_prior_beta: 2.0
+
+  # Recency decay: exponential half-life for weighting historical trades (0 = disabled)
+  recency_halflife_days: 90.0
+
+  # Information Coefficient scoring (0.0 weight = disabled)
+  ic_horizon_days: 7
+  ic_min_trades: 5
+  ic_score_weight: 0.20
+
+  # Scheduled TTR filter: skip entries with fewer than N days to scheduled close (0 = disabled)
+  min_ttr_entry_days: 3
+
+  # Partial exit: close fraction of position when gain exceeds threshold (0 = disabled)
+  partial_exit_gain_threshold: 0.40
+  partial_exit_fraction: 0.50
 
 # =============================================================================
 # STRATEGIES

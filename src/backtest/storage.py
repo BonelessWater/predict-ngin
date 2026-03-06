@@ -229,7 +229,7 @@ def save_backtest_result(
         timestamp=datetime.utcnow().isoformat(),
         git_commit=git_data.get("git_commit"),
         git_branch=git_data.get("git_branch"),
-        parameters=_extract_parameters(result),
+        parameters={**_extract_parameters(result), **(config or {})},
         config_snapshot=config or {},
         environment=env_data,
         tags=tags or [],
@@ -317,11 +317,28 @@ def save_backtest_result(
         try:
             from .catalog import BacktestCatalog
             catalog = BacktestCatalog(base_dir=base_path)
+            # Build a flat metrics dict for the catalog from the result
+            if isinstance(result, dict):
+                direct_metrics = {
+                    "total_trades":    result.get("total_trades", 0),
+                    "win_rate":        result.get("win_rate", 0.0),
+                    "total_net_pnl":   result.get("total_net_pnl", 0.0),
+                    "roi_pct":         result.get("roi_pct", 0.0),
+                    "sharpe_ratio":    result.get("sharpe_ratio", 0.0),
+                    "max_drawdown_pct": result.get("max_drawdown_pct", 0.0),
+                    "profit_factor":   result.get("profit_factor", 0.0),
+                    "avg_win":         result.get("avg_win", 0.0),
+                    "avg_loss":        result.get("avg_loss", 0.0),
+                    "whales_followed": result.get("whales_followed", 0),
+                }
+                index_summary = {"metrics": direct_metrics}
+            else:
+                index_summary = summary_dict if summary else None
             catalog.index_run(
                 run_id=run_id,
                 strategy_name=strategy_name,
                 metadata=metadata.to_dict(),
-                summary=summary_dict if summary else None,
+                summary=index_summary,
                 run_dir=run_dir,
             )
             log.debug(f"Auto-indexed run in catalog: {run_id}")

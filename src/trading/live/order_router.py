@@ -4,15 +4,40 @@ Order Router for Polymarket CLOB
 Routes orders to Polymarket's Central Limit Order Book (CLOB).
 Handles authentication, order creation, and execution.
 
-Requirements:
-- Polymarket API key (CLOB credentials)
-- Funded wallet on Polygon
+Authentication:
+    Polymarket CLOB uses EIP-712 typed-data signing, NOT HMAC.
+    Orders must be signed with a Polygon wallet private key.
+    The recommended approach is the official py-clob-client library.
+
+    Install:  pip install py-clob-client
+    Docs:     https://github.com/Polymarket/py-clob-client
+
+    Required environment variables:
+        POLYMARKET_PRIVATE_KEY    Polygon wallet private key (0x...)
+        POLYMARKET_API_KEY        L2 API key (from CLOB /auth/api-key)
+        POLYMARKET_API_SECRET     L2 API secret
+        POLYMARKET_API_PASSPHRASE L2 API passphrase
+        POLYMARKET_CHAIN_ID       137 (Polygon mainnet) or 80002 (Amoy testnet)
+
+    Obtaining L2 credentials:
+        1. Fund a Polygon wallet with USDC
+        2. Approve USDC on the CTF Exchange contract
+        3. Call POST /auth/api-key signed with your private key to generate L2 keys
+
+    Dry-run mode (default, no credentials needed):
+        router = OrderRouter(dry_run=True)
+        # Simulates order execution using real order book prices
 
 Usage:
-    from src.trading.live.order_router import OrderRouter
+    from src.trading.live.order_router import OrderRouter, OrderSide
 
-    router = OrderRouter(api_key="...", api_secret="...", passphrase="...")
-    order = router.place_market_order(token_id, "buy", size_usd=100)
+    # Paper/dry-run (default)
+    router = OrderRouter(dry_run=True)
+    result = router.place_market_order(token_id, OrderSide.BUY, size_usd=100)
+
+    # Live (requires py-clob-client + credentials)
+    router = OrderRouter(dry_run=False)
+    result = router.place_market_order(token_id, OrderSide.BUY, size_usd=100)
 
 Reference:
 - Polymarket CLOB docs: https://docs.polymarket.com
@@ -21,23 +46,21 @@ Reference:
 
 import os
 import time
-import hmac
-import hashlib
 import json
 import requests
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
 # API endpoints
-CLOB_API = "https://clob.polymarket.com"
+CLOB_API  = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 
 # Rate limiting
 REQUEST_DELAY = 0.1
-MAX_RETRIES = 3
+MAX_RETRIES   = 3
 
 
 class OrderType(Enum):
@@ -86,51 +109,48 @@ class OrderBook:
     midpoint: float
 
 
-class ClobAuth:
+def _build_clob_client():
     """
-    Authentication for Polymarket CLOB API.
+    Build a py-clob-client ClobClient using environment variables.
 
-    Uses HMAC-SHA256 for request signing.
+    Returns the client instance, or None if py-clob-client is not installed
+    or credentials are missing.
+
+    The ClobClient handles all EIP-712 order signing internally.
     """
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds
+    except ImportError:
+        return None
 
-    def __init__(
-        self,
-        api_key: str,
-        api_secret: str,
-        passphrase: str,
-    ):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.passphrase = passphrase
+    private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+    api_key      = os.environ.get("POLYMARKET_API_KEY", "")
+    api_secret   = os.environ.get("POLYMARKET_API_SECRET", "")
+    passphrase   = os.environ.get("POLYMARKET_API_PASSPHRASE", "")
+    chain_id     = int(os.environ.get("POLYMARKET_CHAIN_ID", "137"))
 
-    def sign_request(
-        self,
-        method: str,
-        path: str,
-        body: str = "",
-        timestamp: Optional[str] = None,
-    ) -> Dict[str, str]:
-        """
-        Generate authentication headers for a request.
+    if not private_key:
+        return None
 
-        Returns headers dict with POLY-* auth headers.
-        """
-        if timestamp is None:
-            timestamp = str(int(time.time()))
+    try:
+        creds = ApiCreds(
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=passphrase,
+        ) if api_key else None
 
-        message = timestamp + method.upper() + path + body
-        signature = hmac.new(
-            self.api_secret.encode(),
-            message.encode(),
-            hashlib.sha256,
-        ).hexdigest()
-
-        return {
-            "POLY-API-KEY": self.api_key,
-            "POLY-PASSPHRASE": self.passphrase,
-            "POLY-TIMESTAMP": timestamp,
-            "POLY-SIGNATURE": signature,
-        }
+        client = ClobClient(
+            host=CLOB_API,
+            key=private_key,
+            chain_id=chain_id,
+            creds=creds,
+            signature_type=1,  # EOA wallet
+        )
+        return client
+    except Exception as e:
+        print(f"Warning: could not initialise ClobClient: {e}")
+        return None
 
 
 class OrderRouter:
@@ -140,32 +160,24 @@ class OrderRouter:
     Supports market orders, limit orders, and order management.
     """
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        api_secret: Optional[str] = None,
-        passphrase: Optional[str] = None,
-        dry_run: bool = True,
-    ):
+    def __init__(self, dry_run: bool = True):
         """
         Initialize order router.
 
         Args:
-            api_key: CLOB API key (or set POLYMARKET_API_KEY env var)
-            api_secret: CLOB API secret (or set POLYMARKET_API_SECRET env var)
-            passphrase: CLOB passphrase (or set POLYMARKET_PASSPHRASE env var)
-            dry_run: If True, don't actually submit orders
+            dry_run: If True, simulate execution without submitting real orders.
+                     Real orders require py-clob-client + env vars:
+                     POLYMARKET_PRIVATE_KEY, POLYMARKET_API_KEY,
+                     POLYMARKET_API_SECRET, POLYMARKET_API_PASSPHRASE,
+                     POLYMARKET_CHAIN_ID (default 137)
         """
-        self.api_key = api_key or os.environ.get("POLYMARKET_API_KEY", "")
-        self.api_secret = api_secret or os.environ.get("POLYMARKET_API_SECRET", "")
-        self.passphrase = passphrase or os.environ.get("POLYMARKET_PASSPHRASE", "")
         self.dry_run = dry_run
+        self._clob_client = None if dry_run else _build_clob_client()
 
-        self.auth = ClobAuth(self.api_key, self.api_secret, self.passphrase) if self.api_key else None
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent": "PredictionMarketTrader/1.0",
+            "User-Agent":   "PredictionMarketTrader/1.0",
         })
 
         # Order tracking
@@ -216,8 +228,10 @@ class OrderRouter:
             return False, {"error": str(e)}
 
     def is_authenticated(self) -> bool:
-        """Check if API credentials are configured."""
-        return bool(self.api_key and self.api_secret and self.passphrase)
+        """Check if live credentials are available."""
+        if self.dry_run:
+            return True
+        return self._clob_client is not None
 
     def get_order_book(self, token_id: str) -> Optional[OrderBook]:
         """
@@ -347,53 +361,43 @@ class OrderRouter:
         if not self.is_authenticated():
             return OrderResult(
                 success=False,
-                error="Not authenticated. Set API credentials.",
+                error=(
+                    "Not authenticated. Install py-clob-client and set "
+                    "POLYMARKET_PRIVATE_KEY env var (and optionally "
+                    "POLYMARKET_API_KEY/SECRET/PASSPHRASE for L2 auth)."
+                ),
             )
 
-        # Get best price
-        best_price = self.get_best_price(token_id, side)
-        if not best_price:
-            return OrderResult(
-                success=False,
-                error="Could not get market price",
+        # Live order via py-clob-client (handles EIP-712 signing internally)
+        try:
+            from py_clob_client.clob_types import MarketOrderArgs, BUY, SELL
+
+            best_price = self.get_best_price(token_id, side)
+            if not best_price:
+                return OrderResult(success=False, error="Could not get market price")
+
+            token_size = round(size_usd / best_price, 4)
+            clob_side  = BUY if side == OrderSide.BUY else SELL
+
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=token_size,
             )
+            signed_order = self._clob_client.create_market_order(order_args)
+            resp = self._clob_client.post_order(signed_order, clob_side)
 
-        # Calculate size in tokens
-        token_size = size_usd / best_price
-
-        # Build order payload
-        order_data = {
-            "tokenID": token_id,
-            "side": side.value,
-            "size": str(token_size),
-            "price": str(best_price),
-            "type": "FOK",  # Fill-or-kill for market orders
-        }
-
-        success, response = self._request(
-            "POST",
-            "/order",
-            data=order_data,
-            authenticated=True,
-        )
-
-        if success:
-            order_id = response.get("orderID", response.get("id"))
+            order_id = resp.get("orderID") or resp.get("id", "")
             return OrderResult(
                 success=True,
-                order_id=order_id,
-                status=response.get("status", "submitted"),
-                filled_size=float(response.get("filledSize", 0)),
-                avg_price=float(response.get("avgPrice", best_price)),
-                fees=float(response.get("fee", 0)),
-                raw_response=response,
+                order_id=str(order_id),
+                status=resp.get("status", "submitted"),
+                filled_size=float(resp.get("filledSize", size_usd)),
+                avg_price=float(resp.get("avgPrice", best_price)),
+                fees=float(resp.get("fee", size_usd * 0.001)),
+                raw_response=resp,
             )
-        else:
-            return OrderResult(
-                success=False,
-                error=response.get("error"),
-                raw_response=response,
-            )
+        except Exception as exc:
+            return OrderResult(success=False, error=str(exc))
 
     def place_limit_order(
         self,

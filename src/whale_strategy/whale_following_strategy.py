@@ -23,15 +23,19 @@ from .whale_scoring import (
     MIN_WHALE_SCORE,
 )
 
-# Risk limits from spec
+# Risk limits
 RISK_LIMITS = {
     "max_single_position_pct": 0.05,   # 5% of capital
     "max_single_whale_pct": 0.20,      # 20% to any whale
-    "max_single_market_pct": 0.08,    # 8% to any market
-    "max_category_pct": 0.30,           # 30% to any category
-    "min_reserve_pct": 0.10,           # 10% cash reserve
-    "max_position_usd": 50_000,
+    "max_single_market_pct": 0.08,     # 8% to any market
+    "max_category_pct": 0.30,          # 30% to any category
+    # max_position_usd is a hard ceiling per position; the probability-scaled cap
+    # (p * max_position_usd) is applied inside calculate_position_size, making
+    # high-confidence positions larger and low-confidence positions smaller.
+    "max_position_usd": 250_000,
     "min_position_usd": 5_000,
+    # No reserve (min_reserve_pct removed): deploy all available capital.
+    # No flat notional cap (max_notional_usd removed): probability-scaled cap handles leverage.
 }
 
 # Tier allocation
@@ -40,7 +44,7 @@ TIER_TARGETS = {
     "TIER_2": 0.35,   # 7.0 <= W < 8.0
     "TIER_3": 0.15,   # 6.0 <= W < 7.0
 }
-TIER_MAX_POSITION = {"TIER_1": 50_000, "TIER_2": 30_000, "TIER_3": 20_000}
+TIER_MAX_POSITION = {"TIER_1": 250_000, "TIER_2": 150_000, "TIER_3": 75_000}
 
 
 def _classify_tier(whale_score: float) -> str:
@@ -95,6 +99,9 @@ class WhaleSignal:
     score: float
     datetime: pd.Timestamp
     historical_winrate: float = 0.5
+    taker_address: str = ""          # counterpart wallet on the original trade
+    whale_token_side: str = ""       # "YES" or "NO" — which token the whale bought
+    signal_trade_size_usd: float = 0.0  # original whale trade size (≠ our position size)
 
 
 @dataclass
@@ -108,6 +115,11 @@ class Position:
     whale_address: str
     whale_score: float
     entry_date: pd.Timestamp
+    partial_exit_done: bool = False
+    whale_winrate: float = 0.5
+    taker_address: str = ""
+    whale_token_side: str = ""
+    signal_trade_size_usd: float = 0.0
 
 
 @dataclass
@@ -124,8 +136,7 @@ class StrategyState:
         return sum(p.size_usd for p in self.positions)
 
     def available(self) -> float:
-        reserve = self.total_capital * RISK_LIMITS["min_reserve_pct"]
-        return max(0, self.total_capital - self.deployed() - reserve)
+        return max(0, self.total_capital - self.deployed())
 
     def category_exposure_pct(self, category: str) -> float:
         return self.category_exposure.get(category, 0) / self.total_capital
@@ -155,12 +166,18 @@ def calculate_position_size(
     kelly_frac = _kelly_fraction(p, signal.price, side)
     base_size = kelly_frac * state.available()
 
-    # Hard caps
+    # Probability-scaled hard cap: position ceiling scales with estimated win probability.
+    # At p=0.9 (high confidence): up to 90% of max_position_usd.
+    # At p=0.5 (fair coin): up to 50% of max_position_usd.
+    # At p=0.1 (low confidence): up to 10% of max_position_usd.
+    # This prevents overweighting low-confidence signals while rewarding high-conviction bets.
+    prob_cap = p * RISK_LIMITS["max_position_usd"]
+
     size = min(
         base_size,
-        RISK_LIMITS["max_position_usd"],
+        prob_cap,
         market_liquidity * 0.03,
-        TIER_MAX_POSITION.get(_classify_tier(signal.score), 20_000),
+        TIER_MAX_POSITION.get(_classify_tier(signal.score), 75_000),
     )
 
     if size < RISK_LIMITS["min_position_usd"]:
@@ -260,8 +277,9 @@ def filter_and_score_signals(
         mdf = markets_df.copy()
         mdf["_mid"] = mdf["market_id"].astype(str).str.strip()
         market_meta = mdf.set_index("_mid").to_dict("index")
+        # Prefer cumulative volume (survives market close) over point-in-time liquidity
         liq_col = next(
-            (c for c in ["liquidityNum", "liquidity", "volume", "volumeNum"]
+            (c for c in ["volumeClob", "volume", "volumeNum", "liquidityNum", "liquidity"]
              if c in mdf.columns),
             None,
         )
@@ -340,16 +358,22 @@ def filter_and_score_signals(
             continue
 
         winrate = whale_winrates.get(row[trader_col], 0.5)
+        whale_side = row[direction_col].upper() if pd.notna(row.get(direction_col)) else "BUY"
+        # whale_token_side: YES if whale bought YES tokens (BUY), NO if bought NO tokens (SELL)
+        whale_token_side = "YES" if whale_side == "BUY" else "NO"
         signals.append(WhaleSignal(
             market_id=mid,
             category=row.get("category", "Unknown"),
             whale_address=row[trader_col],
-            side=row[direction_col].upper() if pd.notna(row[direction_col]) else "BUY",
+            side=whale_side,
             price=float(row["price"]),
             size_usd=float(row["usd_amount"]),
             score=row["_score"],
             datetime=row["datetime"],
             historical_winrate=winrate,
+            taker_address=str(row.get("taker", "")) if pd.notna(row.get("taker")) else "",
+            whale_token_side=whale_token_side,
+            signal_trade_size_usd=float(row["usd_amount"]),
         ))
 
     return signals

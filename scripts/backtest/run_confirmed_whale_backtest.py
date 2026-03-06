@@ -473,9 +473,8 @@ def main() -> int:
     whale_set, whale_scores, whale_winrates = build_surprise_positive_whale_set(
         train_trades=trades_df,
         resolution_winners=resolution_winners,
-        min_actual_win_rate=args.min_wr,
         volume_percentile=args.volume_pct,
-        require_positive_surprise=False,   # WR threshold already applied above
+        require_positive_surprise=True,
     )
     print(f"  {len(whale_set):,} qualifying whale addresses")
 

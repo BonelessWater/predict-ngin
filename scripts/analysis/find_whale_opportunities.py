@@ -241,16 +241,15 @@ def find_whale_opportunities(
     if whale_trades.empty:
         return []
 
-    # Filter to qualified whales (WR >= 50%, positive surprise) when research data available
-    if filter_by_performance and cfg.min_whale_wr > 0 and cfg.require_positive_surprise:
+    # Filter to qualified whales (positive surprise: actual WR > expected WR) when research data available
+    if filter_by_performance and cfg.require_positive_surprise:
         all_whales = list(whale_trades["maker"].unique())
         whale_stats = verify_whale_win_rates(all_whales, research_dir, min_trades=cfg.min_trades_for_surprise)
         qualified = {
             addr for addr, s in whale_stats.items()
             if s.get("sample_size", 0) >= cfg.min_trades_for_surprise
-            and s.get("actual_win_rate") is not None
-            and s["actual_win_rate"] >= cfg.min_whale_wr
-            and (s.get("surprise_win_rate") is None or s["surprise_win_rate"] > cfg.min_surprise)
+            and s.get("surprise_win_rate") is not None
+            and s["surprise_win_rate"] > cfg.min_surprise
         }
         if qualified:
             whale_trades = whale_trades[whale_trades["maker"].isin(qualified)]

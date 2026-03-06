@@ -210,7 +210,8 @@ def load_research_prices(
 
 class ResearchPriceStore:
     """
-    Price store that reads from data/research/{category}/prices.parquet.
+    Price store backed by data/research/{category}/prices.parquet when available,
+    falling back to deriving prices from trades.parquet (last-trade price per tick).
 
     Implements the interface expected by polymarket_realistic_backtest
     (price_at_or_before, get_price_history).
@@ -222,30 +223,53 @@ class ResearchPriceStore:
         self._price_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self._load_prices()
 
+    def _ingest(self, mid_str: str, ts_arr: np.ndarray, pr_arr: np.ndarray) -> None:
+        """Merge new (ts, price) arrays into the cache for mid_str."""
+        if len(ts_arr) == 0:
+            return
+        if mid_str in self._price_cache:
+            old_ts, old_pr = self._price_cache[mid_str]
+            ts_arr = np.concatenate([old_ts, ts_arr])
+            pr_arr = np.concatenate([old_pr, pr_arr])
+        idx = np.argsort(ts_arr)
+        self._price_cache[mid_str] = (ts_arr[idx], pr_arr[idx])
+
     def _load_prices(self) -> None:
-        """Load all price data into cache."""
+        """Load price data: prefer prices.parquet, fall back to trades.parquet."""
+        cats_needing_trades: list = []
+
         for cat in self.categories:
-            p = self.research_dir / cat / "prices.parquet"
-            if not p.exists():
+            prices_path = self.research_dir / cat / "prices.parquet"
+            if prices_path.exists():
+                df = pd.read_parquet(prices_path)
+                if df.empty or "market_id" not in df.columns:
+                    cats_needing_trades.append(cat)
+                    continue
+                for mid, g in df.groupby("market_id"):
+                    mid_str = str(mid).strip().replace(".0", "")
+                    g = g.sort_values("timestamp")
+                    ts = pd.to_numeric(g["timestamp"], errors="coerce").dropna().astype("int64").to_numpy()
+                    pr = pd.to_numeric(g["price"], errors="coerce").dropna().astype("float64").to_numpy()
+                    self._ingest(mid_str, ts, pr)
+            else:
+                cats_needing_trades.append(cat)
+
+        # Fall back: derive prices from trade timestamps + trade prices
+        for cat in cats_needing_trades:
+            trades_path = self.research_dir / cat / "trades.parquet"
+            if not trades_path.exists():
                 continue
-            df = pd.read_parquet(p)
-            if df.empty or "market_id" not in df.columns:
-                continue
-            for mid, g in df.groupby("market_id"):
+            df = pd.read_parquet(trades_path, columns=["conditionId", "timestamp", "price"])
+            df = df.dropna(subset=["conditionId", "timestamp", "price"])
+            df["conditionId"] = df["conditionId"].astype(str).str.strip()
+            df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+            df["price"] = pd.to_numeric(df["price"], errors="coerce")
+            df = df.dropna().sort_values("timestamp")
+            for mid, g in df.groupby("conditionId"):
                 mid_str = str(mid).strip().replace(".0", "")
-                g = g.sort_values("timestamp")
-                ts = pd.to_numeric(g["timestamp"], errors="coerce").dropna().astype("int64").to_numpy()
-                pr = pd.to_numeric(g["price"], errors="coerce").dropna().astype("float64").to_numpy()
-                if len(ts) > 0 and len(pr) > 0:
-                    if mid_str in self._price_cache:
-                        # Merge if market appears in multiple categories
-                        old_ts, old_pr = self._price_cache[mid_str]
-                        ts = np.concatenate([old_ts, ts])
-                        pr = np.concatenate([old_pr, pr])
-                        idx = np.argsort(ts)
-                        ts = ts[idx]
-                        pr = pr[idx]
-                    self._price_cache[mid_str] = (ts, pr)
+                ts = g["timestamp"].astype("int64").to_numpy()
+                pr = g["price"].astype("float64").to_numpy()
+                self._ingest(mid_str, ts, pr)
 
     def get_price_history(self, market_id: str, outcome: str = "YES") -> pd.DataFrame:
         """Return price history DataFrame for backtest compatibility."""

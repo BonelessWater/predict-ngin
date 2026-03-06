@@ -72,7 +72,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--backtests-dir",
-        default="backtests",
+        default=str(_project_root / "backtests"),
         help="Backtests directory",
     )
     parser.add_argument(

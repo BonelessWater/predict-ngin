@@ -35,8 +35,8 @@ class WhaleConfig:
     min_surprise: float = 0.0
     min_trades_for_surprise: int = 10
 
-    # Performance filter (default: only follow whales with WR >= 50% and positive surprise)
-    min_whale_wr: float = 0.50
+    # Performance filter: require positive expected return (actual WR > market-implied WR).
+    # Capital-weighted surprise: large trades count more than small trades.
     require_positive_surprise: bool = True
 
     # Default scoring when no resolution
@@ -50,11 +50,10 @@ class WhaleConfig:
     min_trades: int = 10
     min_volume: float = 1000.0
 
-    # Entry price bounds: exclude near-resolved markets.
-    # At YES < 0.02 or YES > 0.98, the implied payout on the losing-side token
-    # is under $0.02 per dollar — economically unviable regardless of whale conviction.
-    # These are symmetric dust-exclusion thresholds, NOT calibrated to backtest PnL.
-    min_entry_yes_price: float = 0.02
+    # Entry price upper bound: exclude near-resolved markets where YES > 0.98.
+    # At YES > 0.98 the implied NO payout is under $0.02 per dollar — economically
+    # unviable regardless of whale conviction.
+    # NOT calibrated to backtest PnL; derived from the dust-exclusion principle.
     max_entry_yes_price: float = 0.98
 
     # Multi-whale confirmation gate (1 = disabled)
@@ -64,6 +63,35 @@ class WhaleConfig:
     # Max calendar days to hold before force-close at CLOB (0 = off).
     # Portfolio management preference — not derived from signal logic.
     max_hold_days: int = 0
+
+    # Bayesian shrinkage: Beta-Binomial prior (α, β). Prior mean = α/(α+β) = 0.50.
+    # With α=β=2, effective prior sample size = 4; shrinks toward 50%.
+    # Corrects winner's curse: a true-50% whale passes 8/10 resolved-trade bar with 17% probability.
+    bayes_prior_alpha: float = 2.0
+    bayes_prior_beta: float = 2.0
+
+    # Recency decay: exponential half-life in days for weighting training-period trades.
+    # 90 days ≈ one quarter — stable enough for statistics, short enough to adapt.
+    # Set to 0 to disable (uniform weighting).
+    recency_halflife_days: float = 90.0
+
+    # Information Coefficient: price-direction accuracy at t+horizon_days.
+    # Measures whether whale entry predicts short-term CLOB price movement (not resolution).
+    # IC is an independent signal from surprise WR; blended as ic_score_weight * IC.
+    ic_horizon_days: int = 7
+    ic_min_trades: int = 5
+    ic_score_weight: float = 0.20
+
+    # Scheduled TTR filter: skip entry when scheduled close date is fewer than N days away.
+    # Uses endDateIso/endDate (published schedule, known at trade time), NOT closedTime.
+    # 3-day minimum avoids last-minute noise trades that lack informed conviction.
+    min_ttr_entry_days: int = 3
+
+    # Partial exit: when unrealized gain >= threshold, close fraction of the position.
+    # Locks in profit on large winners and protects against mean-reversion.
+    # Threshold and fraction are economically motivated, not calibrated to backtest PnL.
+    partial_exit_gain_threshold: float = 0.40
+    partial_exit_fraction: float = 0.50
 
     @property
     def volume_only(self) -> bool:
@@ -75,8 +103,8 @@ class WhaleConfig:
 
     def __repr__(self) -> str:
         parts = [f"mode={self.mode}"]
-        if self.min_whale_wr > 0 or self.require_positive_surprise:
-            parts.append(f"WR>={self.min_whale_wr*100:.0f}% surprise>0")
+        if self.require_positive_surprise:
+            parts.append("positive_surprise=True")
         if self.unfavored_only:
             parts.append(f"unfavored<={self.unfavored_max_price}")
         return f"WhaleConfig({', '.join(parts)})"
@@ -123,8 +151,6 @@ def load_whale_config(config_path: Optional[Path] = None) -> WhaleConfig:
             cfg.min_trades = int(ws["min_trades"])
         if "min_volume" in ws:
             cfg.min_volume = float(ws["min_volume"])
-        if "min_entry_yes_price" in ws:
-            cfg.min_entry_yes_price = float(ws["min_entry_yes_price"])
         if "max_entry_yes_price" in ws:
             cfg.max_entry_yes_price = float(ws["max_entry_yes_price"])
         if "min_confirmation_whales" in ws:
@@ -135,10 +161,26 @@ def load_whale_config(config_path: Optional[Path] = None) -> WhaleConfig:
             cfg.max_hold_days = int(ws["max_hold_days"])
         if "min_usd" in ws:
             cfg.min_usd = float(ws["min_usd"])
-        if "min_whale_wr" in ws:
-            cfg.min_whale_wr = float(ws["min_whale_wr"])
         if "require_positive_surprise" in ws:
             cfg.require_positive_surprise = bool(ws["require_positive_surprise"])
+        if "bayes_prior_alpha" in ws:
+            cfg.bayes_prior_alpha = float(ws["bayes_prior_alpha"])
+        if "bayes_prior_beta" in ws:
+            cfg.bayes_prior_beta = float(ws["bayes_prior_beta"])
+        if "recency_halflife_days" in ws:
+            cfg.recency_halflife_days = float(ws["recency_halflife_days"])
+        if "ic_horizon_days" in ws:
+            cfg.ic_horizon_days = int(ws["ic_horizon_days"])
+        if "ic_min_trades" in ws:
+            cfg.ic_min_trades = int(ws["ic_min_trades"])
+        if "ic_score_weight" in ws:
+            cfg.ic_score_weight = float(ws["ic_score_weight"])
+        if "min_ttr_entry_days" in ws:
+            cfg.min_ttr_entry_days = int(ws["min_ttr_entry_days"])
+        if "partial_exit_gain_threshold" in ws:
+            cfg.partial_exit_gain_threshold = float(ws["partial_exit_gain_threshold"])
+        if "partial_exit_fraction" in ws:
+            cfg.partial_exit_fraction = float(ws["partial_exit_fraction"])
 
     return cfg
 

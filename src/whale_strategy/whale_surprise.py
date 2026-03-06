@@ -254,19 +254,32 @@ def build_surprise_positive_whale_set(
     resolution_winners: Dict[str, str],
     min_surprise: float = 0.0,
     min_trades: int = 10,
-    min_actual_win_rate: float = 0.50,
     require_positive_surprise: bool = True,
     direction_col: str = "maker_direction",
     trader_col: str = "maker",
     volume_percentile: float = 95.0,
+    cutoff: Optional[pd.Timestamp] = None,
+    recency_halflife_days: float = 90.0,
+    bayes_prior_alpha: float = 2.0,
+    bayes_prior_beta: float = 2.0,
 ) -> Tuple[Set[str], Dict[str, float], Dict[str, float]]:
     """
-    Build set of volume whales filtered by WR >= min_actual_win_rate and surprise > min_surprise.
+    Build set of volume whales with positive expected return (capital-weighted surprise > 0).
+
+    Qualifying criterion: shrunk_win_rate > market-implied expected_win_rate.
+    This means the whale's actual win rate exceeds what the market prices implied —
+    i.e. positive expected return on capital deployed.
+
+    Weights each trade by recency_decay * usd_amount so large recent positions
+    count proportionally more than small or stale ones.
+
+    Applies Bayesian shrinkage (Beta-Binomial) to correct winner's curse:
+    an uninformed whale who got lucky on a few large bets gets pulled toward 50%.
 
     Returns:
-        whale_set: Set of whale addresses meeting performance bar
+        whale_set: Set of whale addresses with positive expected return
         whale_scores: Dict[whale_address, score] for filter_and_score_signals
-        whale_winrates: Dict[whale_address, actual_win_rate] for Kelly sizing
+        whale_winrates: Dict[whale_address, shrunk_win_rate] for Kelly sizing
     """
     trades_with_whale = identify_whales_rolling(
         train_trades,
@@ -281,9 +294,6 @@ def build_surprise_positive_whale_set(
 
     whale_addresses = set(whale_trades[trader_col].unique())
 
-    # Vectorized scoring for all whale addresses at once.
-    # Use train_trades (not just whale_trades) to match the original per-address
-    # behavior which scores based on all resolved trades by each address.
     resolved_ids = set(resolution_winners.keys())
     wr = train_trades[
         train_trades[trader_col].isin(whale_addresses) &
@@ -307,7 +317,7 @@ def build_surprise_positive_whale_set(
     wr["_correct"] = (
         ((dir_lower == "buy") & (winner_up == "YES")) |
         ((dir_lower == "sell") & (winner_up == "NO"))
-    )
+    ).astype(float)
     resolution_val = winner_up.map({"YES": 1.0, "NO": 0.0})
     wr["_roi"] = np.where(
         dir_lower == "buy",
@@ -315,35 +325,71 @@ def build_surprise_positive_whale_set(
         (price - resolution_val) / np.maximum(1.0 - price, 0.01),
     )
 
-    # Aggregate per whale
+    # Combined weight = recency_decay * usd_amount.
+    # Large recent positions (high capital, recent) dominate the score;
+    # small or stale trades have proportionally less influence.
+    # Recency decay: weight = exp(-ln(2)/halflife * days_ago).
+    if cutoff is not None and recency_halflife_days > 0:
+        ref = pd.Timestamp(cutoff)
+        days_ago = (ref - wr["datetime"]).dt.total_seconds().clip(lower=0.0) / 86400.0
+        recency = np.exp(-np.log(2.0) / recency_halflife_days * days_ago)
+    else:
+        recency = np.ones(len(wr))
+    wr["_weight"] = recency * wr["usd_amount"].astype(float).clip(lower=1.0)
+
+    wr["_w_correct"] = wr["_weight"] * wr["_correct"]
+    wr["_w_expected"] = wr["_weight"] * wr["_expected_wr"]
+    wr["_w_roi"] = wr["_weight"] * wr["_roi"]
+
+    # Aggregate per whale (weighted)
     stats = wr.groupby(trader_col).agg(
         sample_size=(trader_col, "count"),
-        actual_win_rate=("_correct", "mean"),
-        expected_win_rate=("_expected_wr", "mean"),
-        avg_roi=("_roi", "mean"),
+        weight_sum=("_weight", "sum"),
+        w_correct=("_w_correct", "sum"),
+        w_expected=("_w_expected", "sum"),
+        w_roi=("_w_roi", "sum"),
     ).reset_index()
 
-    # Population std (ddof=0) to match original np.std behaviour
+    stats["actual_win_rate"] = stats["w_correct"] / stats["weight_sum"]
+    stats["expected_win_rate"] = stats["w_expected"] / stats["weight_sum"]
+    stats["avg_roi"] = stats["w_roi"] / stats["weight_sum"]
+
+    # Bayesian shrinkage: Beta-Binomial prior (α, β).
+    # shrunk_wr = (weighted_wins + α) / (effective_n + α + β)
+    # Prior mean = α/(α+β) = 0.50 (with α=β=2); effective prior sample = 4 trades.
+    # Corrects winner's curse: an uninformed whale selecting 8/10 by chance is pulled back to 0.50.
+    effective_n = stats["weight_sum"]
+    weighted_wins = stats["w_correct"]
+    stats["shrunk_win_rate"] = (weighted_wins + bayes_prior_alpha) / (
+        effective_n + bayes_prior_alpha + bayes_prior_beta
+    )
+
+    # Population std for Sharpe (unweighted — stable enough for ranking)
     roi_std = wr.groupby(trader_col)["_roi"].std(ddof=0).rename("roi_std")
     stats = stats.join(roi_std, on=trader_col)
     stats["roi_std"] = stats["roi_std"].fillna(0.0)
-
-    stats["surprise_win_rate"] = stats["actual_win_rate"] - stats["expected_win_rate"]
     stats["sharpe"] = stats["avg_roi"] / (stats["roi_std"] + 1e-6)
+    stats["surprise_win_rate"] = stats["actual_win_rate"] - stats["expected_win_rate"]
 
-    # Apply filters
+    # Filter 1: minimum trade count (count-based, not capital-weighted — prevents single huge bet qualifying)
     stats = stats[stats["sample_size"] >= min_trades]
-    stats = stats[stats["actual_win_rate"] >= min_actual_win_rate]
+
+    # Filter 2: positive expected return — shrunk win rate must exceed market-implied expected win rate.
+    # shrunk_win_rate > expected_win_rate means the whale beat the market's probabilities
+    # after correcting for winner's curse via Bayesian shrinkage.
+    # Capital-weighting means a whale who was right on large positions counts proportionally more.
+    shrunk_surprise = stats["shrunk_win_rate"] - stats["expected_win_rate"]
     if require_positive_surprise:
-        stats = stats[stats["surprise_win_rate"] > min_surprise]
+        stats = stats[shrunk_surprise > min_surprise]
     else:
-        stats = stats[stats["surprise_win_rate"] >= min_surprise]
+        stats = stats[shrunk_surprise >= min_surprise]
 
     if stats.empty:
         return set(), {}, {}
 
-    # Compute composite scores (mirrors calculate_performance_score_with_surprise)
-    surprise_score = (stats["surprise_win_rate"] / 0.15 * 5.0 + 5.0).clip(0.0, 10.0)
+    # Compute composite scores using shrunk_win_rate-derived surprise
+    shrunk_surprise = (stats["shrunk_win_rate"] - stats["expected_win_rate"])
+    surprise_score = (shrunk_surprise / 0.15 * 5.0 + 5.0).clip(0.0, 10.0)
     roi_score = (stats["avg_roi"] * 10.0).clip(upper=10.0)
     sharpe_score = stats["sharpe"].clip(lower=0.0) * 2.0
     stats["score"] = (
@@ -352,10 +398,73 @@ def build_surprise_positive_whale_set(
 
     whale_set: Set[str] = set(stats[trader_col])
     whale_scores: Dict[str, float] = stats.set_index(trader_col)["score"].to_dict()
+    # Return shrunk WR for Kelly sizing — corrected for winner's curse
     whale_winrates: Dict[str, float] = (
-        stats.set_index(trader_col)["actual_win_rate"].to_dict()
+        stats.set_index(trader_col)["shrunk_win_rate"].to_dict()
     )
     return whale_set, whale_scores, whale_winrates
+
+
+def compute_whale_ic(
+    train_trades: pd.DataFrame,
+    price_lookup_fn,
+    horizon_days: int = 7,
+    min_trades: int = 5,
+    trader_col: str = "maker",
+    direction_col: str = "maker_direction",
+) -> Dict[str, float]:
+    """
+    Compute per-whale Information Coefficient (IC) from training trades.
+
+    IC = fraction of trades where the whale correctly predicted short-term YES price direction.
+    - BUY: correct if CLOB price rose by t+horizon_days
+    - SELL: correct if CLOB price fell by t+horizon_days
+    IC is centered at 0.50 (random); IC > 0.50 indicates directional skill.
+
+    This is an independent signal from resolution-based win rate — it measures
+    short-term conviction, not binary outcome prediction.
+
+    Args:
+        train_trades: Historical trades DataFrame
+        price_lookup_fn: Callable(market_id, date) -> float|None  (CLOB YES price)
+        horizon_days: Days after trade to measure price direction
+        min_trades: Minimum trades to compute IC
+        trader_col: Column name for trader address
+        direction_col: Column name for direction (buy/sell)
+
+    Returns:
+        Dict[whale_address, ic_score] where ic_score in [0.0, 1.0], 0.50 = random
+    """
+    df = train_trades.copy()
+    df["_mid"] = df["market_id"].astype(str).str.strip().str.replace(".0", "", regex=False)
+    df["_dir"] = df[direction_col].str.lower()
+    df["_price"] = df["price"].astype(float)
+    df["_horizon_date"] = df["datetime"] + pd.Timedelta(days=horizon_days)
+
+    results = {}
+    for whale, group in df.groupby(trader_col):
+        if len(group) < min_trades:
+            continue
+
+        correct_count = 0
+        valid_count = 0
+        for _, row in group.iterrows():
+            future_price = price_lookup_fn(row["_mid"], row["_horizon_date"])
+            if future_price is None:
+                continue
+            entry_price = row["_price"]
+            direction = row["_dir"]
+            if direction == "buy":
+                correct = future_price > entry_price
+            else:  # sell = short YES = expect price to fall
+                correct = future_price < entry_price
+            correct_count += int(correct)
+            valid_count += 1
+
+        if valid_count >= min_trades:
+            results[whale] = correct_count / valid_count
+
+    return results
 
 
 def build_volume_whale_set(

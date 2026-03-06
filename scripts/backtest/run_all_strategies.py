@@ -173,7 +173,7 @@ def main() -> int:
     )
     parser.add_argument("--trades-dir", default="data/polymarket/trades", help="Trades parquet directory")
     parser.add_argument("--research-dir", default="data/research", help="Research data (fallback)")
-    parser.add_argument("--output-dir", default="data/backtests", help="Output for QuantStats HTML")
+    parser.add_argument("--output-dir", default="data/output/backtests", help="Output for QuantStats HTML")
     parser.add_argument("--start-date", default=None, help="Start date YYYY-MM-DD")
     parser.add_argument("--end-date", default=None, help="End date YYYY-MM-DD")
     parser.add_argument("--position-size", type=float, default=250.0, help="Position size per trade")
